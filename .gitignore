@@ -1,0 +1,15 @@
+node_modules/
+.client-build/
+coverage/
+*.log
+*.tgz
+.env
+.env.*
+!.env.example
+.DS_Store
+Thumbs.db
+
+# Never commit local DSH data.
+.dsh/
+memory/
+sessions/
