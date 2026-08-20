@@ -1,0 +1,10 @@
+# dsh-memory bundle patch:结构化记忆系统(复刻 Claude Code auto-memory)
+# host 侧提供 memory_* 工具 + 回合自动记录 + 会话回顾注入;client 侧在
+# 设置 → 插件 页新增「记忆」tab。
+
+- insert:
+    - id: dsh-memory
+      name: dsh-memory
+      config:
+        reviewEnabled: true
+        reviewInterval: 5
