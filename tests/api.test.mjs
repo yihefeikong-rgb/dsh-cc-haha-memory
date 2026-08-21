@@ -66,3 +66,15 @@ test('API 索引和 get 不泄漏其他项目', async () => {
     assert.equal(hidden.status, 404)
   })
 })
+
+test('API 搜索 limit 与后端对齐,最多返回 50 条', async () => {
+  await fixture(async ({ ctx, store }) => {
+    for (let index = 0; index < 55; index++) {
+      await store.write({ title: '条目 ' + index, content: '内容 ' + index, type: 'reference' }, { scope: 'demo' })
+    }
+    const result = await call(ctx, store, 'GET', 'search?sessionId=session-1&q=%E6%9D%A1%E7%9B%AE&limit=100')
+    assert.equal(result.status, 200)
+    assert.ok(result.data.count <= 50, '后端搜索上限必须为 50,与 UI 对齐')
+    assert.ok(result.data.results.length <= 50)
+  })
+})

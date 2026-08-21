@@ -198,3 +198,43 @@ test('同批重复 create 在任何写入前整体拒绝', async () => {
     assert.equal((await recorder.store.manifest([scope])).length, 0)
   })
 })
+
+test('只有 completed 的 turn/end 才推进计数并触发评审', async () => {
+  const waitFor = async (predicate, timeout = 2_000) => {
+    const start = Date.now()
+    while (!predicate()) {
+      if (Date.now() - start > timeout) throw new Error('等待评审完成超时')
+      await new Promise((resolve) => setTimeout(resolve, 10))
+    }
+  }
+  await fixture([{ type: 'text-delta', text: '{"actions":[]}' }, { type: 'finish', reason: { kind: 'stop' } }], async ({ recorder, repo, calls }) => {
+    recorder.sessionCwds.set('session-1', repo)
+    recorder.pushMessage('session-1', 'user', '记住技术选型')
+    for (const kind of ['error', 'max-tokens', 'aborted', 'blocked', 'interrupted']) {
+      recorder.handleEvent({ id: 'session-1' }, { type: 'turn/end', data: { reason: { kind } } })
+      assert.equal(recorder.turnCounts.get('session-1'), undefined, `kind=${kind} 不应推进计数`)
+    }
+    assert.equal(recorder.buffers.get('session-1').length, 1, '非 completed 应保留缓冲')
+    assert.equal(calls.length, 0, '非 completed 不应触发评审')
+    recorder.handleEvent({ id: 'session-1' }, { type: 'turn/end', data: { reason: { kind: 'completed' } } })
+    assert.equal(recorder.turnCounts.get('session-1'), 1)
+    await waitFor(() => recorder.buffers.get('session-1')?.length === 0)
+    assert.ok(calls.length >= 1, 'completed 应触发评审')
+  })
+})
+
+test('首次空输出自动重试，第二次成功才落盘', async () => {
+  const streams = [
+    [{ type: 'text-delta', text: '' }, { type: 'finish', reason: { kind: 'stop' } }],
+    [{ type: 'text-delta', text: '{"actions":[]}' }, { type: 'finish', reason: { kind: 'stop' } }],
+  ]
+  let streamIndex = 0
+  await fixture(() => streamOf(streams[Math.min(streamIndex++, streams.length - 1)]), async ({ recorder, repo, calls }) => {
+    recorder.sessionCwds.set('session-1', repo)
+    recorder.pushMessage('session-1', 'user', '记住技术选型')
+    const result = await recorder.maybeReview('session-1')
+    assert.equal(result.status, 'none', '空输出应自动重试而非直接失败')
+    assert.equal(calls.length, 2, '应发起两次 LLM 调用')
+    assert.equal(recorder.buffers.get('session-1').length, 0)
+  })
+})

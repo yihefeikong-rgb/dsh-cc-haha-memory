@@ -3,7 +3,7 @@ import { extractEventText } from './events.ts'
 import { parseTags, slugify } from './store.ts'
 import { GENERAL_SCOPE, resolveProjectScope } from './scope.ts'
 
-const REVIEWABLE_KINDS = new Set(['completed', 'max-tokens', 'error'])
+const REVIEWABLE_KINDS = new Set(['completed'])
 const MAX_MESSAGE_CHARS = 8_000
 const MAX_BUFFER_MESSAGES = 50
 
@@ -251,7 +251,7 @@ export class TurnRecorder {
         throw new ReviewError(finish.failure?.code ?? `LLM_${finish.kind.toUpperCase()}`, finish.failure?.message ?? `LLM ${finish.kind}`)
       }
       if (!finish) throw new ReviewError('LLM_NO_FINISH', '自动记录模型流结束但没有 finish 终态')
-      if (!text.trim()) throw new ReviewError('LLM_EMPTY_OUTPUT', '自动记录模型没有返回文本')
+      if (!text.trim()) throw new ReviewError('REVIEW_EMPTY_OUTPUT', '自动记录模型没有返回文本')
       return { text, truncated: finish?.kind === 'max-tokens' }
     }
 

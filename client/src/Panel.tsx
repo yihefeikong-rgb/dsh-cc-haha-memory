@@ -38,7 +38,7 @@ export default function MemoryPanel({ sessionId, useSessions }) {
     setError('')
     try {
       if (q.trim()) {
-        const data = await api(`search?q=${encodeURIComponent(q)}&limit=100`, {}, sessionId)
+        const data = await api(`search?q=${encodeURIComponent(q)}&limit=50`, {}, sessionId)
         setEntries((data.results ?? []).map((r) => ({ ...r, section: pathSection(r.id ?? r.rel) })))
       } else {
         const data = await api('index', {}, sessionId)

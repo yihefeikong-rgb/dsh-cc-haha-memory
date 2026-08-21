@@ -3,7 +3,7 @@ import assert from 'node:assert/strict'
 import { access, mkdir, mkdtemp, rm } from 'node:fs/promises'
 import { join } from 'node:path'
 import { tmpdir } from 'node:os'
-import { MemoryStore } from '../src/store.ts'
+import { MemoryStore, slugify } from '../src/store.ts'
 import { registerMemoryTools } from '../src/tools.ts'
 
 async function fixture(fn) {
@@ -110,5 +110,38 @@ test('同名工具写入返回冲突而不覆盖', async () => {
     assert.equal(conflict.ok, false)
     assert.equal(conflict.code, 'MEMORY_CONFLICT')
     assert.equal((await store.get('demo/规则')).content, '原内容')
+  })
+})
+
+test('memory_remember 截断 slug 命中但完整标题不同时必须显式冲突，不能误更新', async () => {
+  await fixture(async ({ store, registered, exec }) => {
+    const remember = registered.get('memory_remember')
+    const longA = '相同前缀'.repeat(20) + '甲'
+    const longB = '相同前缀'.repeat(20) + '乙'
+    assert.ok(longA.length > 48)
+    assert.equal(slugify(longA), slugify(longB), '前置条件:两标题截断后同 slug')
+    const first = await remember.execute({ title: longA, content: '甲内容', type: 'project' }, exec)
+    assert.equal(first.saved, true)
+    assert.equal(first.action, 'created')
+    const second = await remember.execute({ title: longB, content: '乙内容', type: 'project' }, exec)
+    assert.equal(second.saved, false, '标题不同必须显式冲突')
+    assert.equal(second.code, 'MEMORY_CONFLICT')
+    const stored = await store.get(first.id)
+    assert.equal(stored.content, '甲内容', '原记忆不能被误更新')
+    assert.equal(stored.name, longA)
+    assert.equal((await store.manifest(['demo'])).length, 1)
+  })
+})
+
+test('memory_remember 用持久化后的等价标题重复调用时正常更新', async () => {
+  await fixture(async ({ store, registered, exec }) => {
+    const remember = registered.get('memory_remember')
+    const first = await remember.execute({ title: '规则 \n', content: '第一版', type: 'project' }, exec)
+    assert.equal(first.saved, true)
+    const second = await remember.execute({ title: '规则 \n', content: '第二版', type: 'project' }, exec)
+    assert.equal(second.saved, true)
+    assert.equal(second.action, 'updated')
+    assert.equal((await store.manifest(['demo'])).length, 1)
+    assert.equal((await store.get(first.id)).content, '第二版')
   })
 })

@@ -6,7 +6,7 @@
  * 工具注册用纯对象风格(参考 dsh-memory-evolve sessionToolDefinition),
  * 不依赖 @deepseek-ai/dsh-tools 的类型。
  */
-import { MEMORY_TYPES, slugify } from './store.ts'
+import { MEMORY_TYPES, normalizeMemoryTitle, slugify } from './store.ts'
 import { GENERAL_SCOPE, resolveProjectScope, scopesForCwd, topScopeFromId } from './scope.ts'
 
 const STR = { type: 'string' }
@@ -210,9 +210,14 @@ async function findRememberTarget(store, scope, title, requestedId) {
     return memory ? { memory } : { code: 'MEMORY_NOT_FOUND', error: `记忆不存在: ${requestedId}` }
   }
 
-  const exact = await store.get(`${scope}/${slugify(title)}`, { scopes: [scope] })
-  if (exact) return { memory: exact }
-
+  const slug = slugify(title)
+  const exact = await store.get(`${scope}/${slug}`, { scopes: [scope] })
+  if (exact) {
+    if (normalizeMemoryTitle(exact.name) !== normalizeMemoryTitle(title)) {
+      return { code: 'MEMORY_CONFLICT', error: `标题不同但文件名截断冲突("${exact.name}" vs "${title}"): ${scope}/${slug}；请改用 memory_update 更新原条目或换用其他标题` }
+    }
+    return { memory: exact }
+  }
   return null
 }
 

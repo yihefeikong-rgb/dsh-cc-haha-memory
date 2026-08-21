@@ -52,7 +52,7 @@ export function parseFrontmatter(text) {
 /** 序列化为 Markdown + YAML frontmatter。 */
 export function serializeMemory(memory) {
   const lines = ['---']
-  if (memory.name) lines.push(`name: ${frontmatterLine(memory.name)}`)
+  if (memory.name) lines.push(`name: ${normalizeMemoryTitle(memory.name)}`)
   if (memory.description) lines.push(`description: ${frontmatterLine(memory.description)}`)
   if (memory.type) lines.push(`type: ${frontmatterLine(memory.type)}`)
   if (memory.created) lines.push(`created: ${frontmatterLine(memory.created)}`)
@@ -68,6 +68,10 @@ export function serializeMemory(memory) {
 
 function frontmatterLine(value) {
   return String(value ?? '').replace(/\r?\n/g, ' ').trim()
+}
+
+export function normalizeMemoryTitle(value) {
+  return frontmatterLine(value)
 }
 
 /** title → 文件名(保留中文,清理非法字符,截断)。 */

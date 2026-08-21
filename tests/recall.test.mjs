@@ -1,6 +1,6 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { mkdir, mkdtemp, rm } from 'node:fs/promises'
+import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import { tmpdir } from 'node:os'
 import { MemoryStore } from '../src/store.ts'
@@ -89,5 +89,19 @@ test('明确记住时追加首轮 read 后调用 memory_remember 的引导', asy
     )
     assert.equal(assembled.contexts[0].name, 'memory:index')
     assert.match(assembled.contexts[0].text, /若首轮 memory_remember 尚未暴露，先用 read/)
+  })
+})
+
+test('召回索引超过 200 行或字节上限时截断并告警', async () => {
+  await fixture(async ({ store, repo }) => {
+    await mkdir(join(store.root, 'za xiang'), { recursive: true })
+    for (let index = 0; index < 210; index++) {
+      await writeFile(join(store.root, 'za xiang', 'm' + index + '.md'), '记忆 ' + index, 'utf8')
+    }
+    const text = recallText(store, {}, repo, '')
+    assert.match(text, /WARNING：记忆索引超过 200 行或 25KB/)
+    assert.ok(text.split('\n').filter((line) => line.startsWith('- [')).length <= 200)
+    const small = recallText(store, { recallMaxBytes: 300 }, repo, '')
+    assert.match(small, /WARNING：记忆索引超过 200 行或 25KB/)
   })
 })
