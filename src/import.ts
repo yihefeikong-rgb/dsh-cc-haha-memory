@@ -123,8 +123,9 @@ export async function importClaudeMemory(storageRoot, options = {}) {
 
   for (const project of projects) {
     const projectName = (await resolveProjectName(project.dir, projectsRoot)) ?? project.dir
-    const targetRoot = join(storageRoot, projectName)
-    await mkdir(targetRoot, { recursive: true })
+    // 解析不出真实项目名(会话缺 cwd 且 slug 解码失败)→ 跳过,
+    // 避免每次启动都重建 D--... 机器 slug 目录
+    if (projectName === project.dir) continue
 
     // 项目内同名文件保留内容最完整的一份
     const byName = new Map()
@@ -140,6 +141,15 @@ export async function importClaudeMemory(storageRoot, options = {}) {
       const existing = byName.get(key)
       if (!existing || content.length > existing.content.length) byName.set(key, { abs, content })
     }
+
+    // 只有存在待写入的项目文件时才创建目标目录(不建空目录)
+    const pendingFiles = [...byName.values()]
+      .filter(({ abs }) => !GENERIC_SUBDIRS.has(basename(join(abs, '..'))))
+      .filter(({ abs }) => !marker[abs])
+    if (pendingFiles.length === 0) continue
+
+    const targetRoot = join(storageRoot, projectName)
+    await mkdir(targetRoot, { recursive: true })
 
     for (const { abs, content } of byName.values()) {
       // 通用基线目录 → 顶层"通用"(跨项目内容去重,只留最完整一份)

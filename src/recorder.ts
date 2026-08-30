@@ -3,7 +3,7 @@ import { extractEventText } from './events.ts'
 import { parseTags, slugify } from './store.ts'
 import { GENERAL_SCOPE, resolveProjectScope } from './scope.ts'
 
-const REVIEWABLE_KINDS = new Set(['completed'])
+const REVIEWABLE_KINDS = new Set(['completed', 'max-tokens', 'error'])
 const MAX_MESSAGE_CHARS = 8_000
 const MAX_BUFFER_MESSAGES = 50
 
@@ -11,9 +11,14 @@ const REVIEW_SYSTEM = [
   '你是项目记忆提取器。只输出严格 JSON，不要输出代码块或解释。',
   '格式：{"actions":[{"action":"create|update|delete","id":"更新/删除时必填","type":"user|feedback|project|reference","title":"创建时必填","content":"创建/更新正文","description":"一行索引说明","tags":["标签"]}]}。',
   '没有值得长期保存的信息时，必须明确输出 {"actions":[]}。',
-  '只保存：用户画像、用户对工作方式的反馈、无法从代码或 Git 推断的项目决策/状态、外部系统或工具引用。',
-  '不要保存：能从当前代码/Git/计划直接得到的信息、一次性调试过程、寒暄、临时任务清单。',
-  '先检查已有记忆。相同主题优先 update；不要创建重复条目；只有明确过时且应移除时才 delete。',
+  '记忆类型（严格四选一）：',
+  '- user: 用户画像——用户的角色、目标、技能水平与协作偏好（工作方式/回复风格）',
+  '- feedback: 行为反馈——用户对你工作方式的纠正或肯定；正文末尾必须含 "**Why:**" 与 "**How to apply:**" 两段',
+  '- project: 无法从代码或 Git 推断的项目动态——谁在做什么、为什么、截止日期；相对日期（"昨天""周四"）必须转换为绝对日期（YYYY-MM-DD）',
+  '- reference: 指向外部系统的指针——仪表板、工单系统、工具用法、外部资源位置',
+  '必须保存：跨会话仍有价值的用户画像、行为反馈、项目决策/状态、外部系统与工具引用。',
+  '不要保存：能从当前代码/Git/计划直接推断的信息、一次性调试过程、寒暄、临时任务清单、会话原文搬运。',
+  '先检查已有记忆。相同主题优先 update；不要创建近似重复条目；只有明确过时且应移除时才 delete。更新时保留源文件中仍有效的内容。',
 ].join('\n')
 
 export class ReviewError extends Error {
@@ -150,7 +155,7 @@ export class TurnRecorder {
       if (action.action === 'create') {
         await this.store.write({
           title: action.title,
-          content: action.content,
+          content: stripFrontmatter(action.content),
           description: action.description,
           type: action.type ?? 'reference',
           tags: Array.isArray(action.tags) ? action.tags.map(String) : parseTags(action.tags),
@@ -158,7 +163,7 @@ export class TurnRecorder {
         continue
       }
       if (action.action === 'update') {
-        const result = await this.store.update(action.id, { ...action, scopes: [scope] })
+        const result = await this.store.update(action.id, { ...action, content: stripFrontmatter(action.content), scopes: [scope] })
         if (!result) throw new ReviewError('MEMORY_NOT_FOUND', `待更新记忆不存在: ${action.id}`)
       } else if (action.action === 'delete') {
         const removed = await this.store.remove(action.id, { scopes: [scope] })
@@ -189,12 +194,23 @@ export class TurnRecorder {
       ? manifest.map((item) => `- ${item.id} [${item.type}] ${item.title}${item.description ? ` — ${item.description}` : ''}`).join('\n')
       : '(当前作用域没有已有记忆)'
     const prompt = `已有记忆清单：\n${existing}\n\n待评审对话：\n${transcript}\n\n输出动作 JSON。`
+    const controller = new AbortController()
     const timeoutMs = Math.max(this.config.reviewTimeoutMs ?? 120_000, 1)
-    // 0 = 无上限(不传 maxTokens,交给 provider 默认),>0 时手动限制
-    const maxTokens = Number(this.config.reviewMaxTokens) > 0 ? Math.max(Number(this.config.reviewMaxTokens), 256) : 0
-
-    const buildParams = (withReasoning, tokenCap) => {
-      const params = {
+    const maxTokens = this.config.reviewMaxTokens ?? 1_000
+    let timeout
+    let iterator
+    let done = false
+    let terminal = false
+    let text = ''
+    let finish
+    const timeoutPromise = new Promise((_, reject) => {
+      timeout = setTimeout(() => {
+        controller.abort()
+        reject(new ReviewError('REVIEW_TIMEOUT', `自动记录评审超过 ${timeoutMs}ms`))
+      }, timeoutMs)
+    })
+    try {
+      const stream = await Promise.race([llm.stream({
         provider,
         model,
         system: REVIEW_SYSTEM,
@@ -205,92 +221,37 @@ export class TurnRecorder {
           content: [{ type: 'text', text: prompt }],
         }],
         temperature: 0,
-      }
-      if (tokenCap && tokenCap > 0) params.maxTokens = tokenCap
-      if (withReasoning) params.reasoningEffort = 'off'
-      return params
-    }
-
-    /** 单次完整流式调用(含 finish 终态检查)，失败抛 ReviewError。 */
-    const runOnce = async (params) => {
-      const controller = new AbortController()
-      let timeout
-      const timeoutPromise = new Promise((_, reject) => {
-        timeout = setTimeout(() => {
-          controller.abort()
-          reject(new ReviewError('REVIEW_TIMEOUT', `自动记录评审超过 ${timeoutMs}ms`))
-        }, timeoutMs)
-      })
-      let iterator
-      let done = false
-      let terminal = false
-      let text = ''
-      let finish
-      try {
-        const stream = await Promise.race([llm.stream({ ...params, signal: controller.signal }), timeoutPromise])
-        iterator = stream[Symbol.asyncIterator]()
-        while (true) {
-          const step = await Promise.race([iterator.next(), timeoutPromise])
-          if (step.done) { done = true; break }
-          const chunk = step.value
-          if (chunk?.type === 'text-delta') text += chunk.text ?? ''
-          if (chunk?.type === 'finish') {
-            finish = chunk.reason
-            terminal = true
-            break
-          }
-        }
-      } finally {
-        if (timeout) clearTimeout(timeout)
-        if (!done) {
-          if (!terminal) controller.abort()
-          try { void iterator?.return?.() } catch { /* 释放失败不覆盖原错误 */ }
+        reasoningEffort: 'off',
+        maxTokens,
+        signal: controller.signal,
+      }), timeoutPromise])
+      iterator = stream[Symbol.asyncIterator]()
+      while (true) {
+        const step = await Promise.race([iterator.next(), timeoutPromise])
+        if (step.done) { done = true; break }
+        const chunk = step.value
+        if (chunk?.type === 'text-delta') text += chunk.text ?? ''
+        if (chunk?.type === 'finish') {
+          finish = chunk.reason
+          terminal = true
+          break
         }
       }
-      if (finish?.kind === 'error' || finish?.kind === 'aborted') {
-        throw new ReviewError(finish.failure?.code ?? `LLM_${finish.kind.toUpperCase()}`, finish.failure?.message ?? `LLM ${finish.kind}`)
-      }
-      if (!finish) throw new ReviewError('LLM_NO_FINISH', '自动记录模型流结束但没有 finish 终态')
-      if (!text.trim()) throw new ReviewError('REVIEW_EMPTY_OUTPUT', '自动记录模型没有返回文本')
-      return { text, truncated: finish?.kind === 'max-tokens' }
-    }
-
-    /** 一次"发起+解析"尝试；输出被截断时先试解析，失败则(仅当设了有限上限)放大再试一次。 */
-    const attempt = async (withReasoning, tokenCap) => {
-      let first
-      try {
-        first = await runOnce(buildParams(withReasoning, tokenCap))
-      } catch (error) {
-        // 部分 provider 在省略 maxTokens(0) 时返回空输出 → 显式给大上限重试一次
-        if (error?.code === 'REVIEW_EMPTY_OUTPUT' && !(tokenCap > 0)) {
-          first = await runOnce(buildParams(withReasoning, 16384))
-        } else {
-          throw error
-        }
-      }
-      if (!first.truncated) return parseReviewJson(first.text)
-      try {
-        return parseReviewJson(first.text)
-      } catch {
-        if (tokenCap > 0) {
-          const retried = await runOnce(buildParams(withReasoning, tokenCap * 2))
-          return parseReviewJson(retried.text)
-        }
-        throw new ReviewError('REVIEW_JSON_INVALID', '自动记录输出被 provider 截断且 JSON 不完整')
+    } finally {
+      if (timeout) clearTimeout(timeout)
+      if (!done) {
+        if (!terminal) controller.abort()
+        try { void iterator?.return?.() } catch { /* 释放失败不覆盖原错误 */ }
       }
     }
 
-    let parsed
-    try {
-      parsed = await attempt(true, maxTokens)
-    } catch (error) {
-      // 部分 provider/model 不支持 reasoningEffort('off')，降级重试一次不带该参数
-      if (/reasoning\s?effort/i.test(String(error?.message ?? ''))) {
-        parsed = await attempt(false, maxTokens)
-      } else {
-        throw error
-      }
+    if (finish?.kind === 'error' || finish?.kind === 'aborted') {
+      throw new ReviewError(finish.failure?.code ?? `LLM_${finish.kind.toUpperCase()}`, finish.failure?.message ?? `LLM ${finish.kind}`)
     }
+    if (!finish) throw new ReviewError('LLM_NO_FINISH', '自动记录模型流结束但没有 finish 终态')
+    if (finish?.kind === 'max-tokens') throw new ReviewError('LLM_MAX_TOKENS', '自动记录输出达到 token 上限，结果可能不完整')
+    if (!text.trim()) throw new ReviewError('LLM_EMPTY_OUTPUT', '自动记录模型没有返回文本')
+    const parsed = parseReviewJson(text)
     return parsed
   }
 
@@ -323,6 +284,13 @@ export function parseReviewJson(text) {
   if (!Array.isArray(parsed.actions)) throw new ReviewError('INVALID_SCHEMA', '自动记录输出缺少 actions 数组')
   const actions = parsed.actions.map(validateAction)
   return { actions }
+}
+
+/** 剥离模型输出中误带的 frontmatter 块(落盘时由 store 重新序列化)。 */
+function stripFrontmatter(text) {
+  const s = String(text ?? '')
+  const m = /^---\r?\n[\s\S]*?\r?\n---\r?\n?/.exec(s)
+  return m ? s.slice(m[0].length) : s
 }
 
 function validateAction(action) {

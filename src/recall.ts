@@ -4,7 +4,7 @@
 import { readdirSync, readFileSync, statSync } from 'node:fs'
 import { join } from 'node:path'
 import { extractEventText } from './events.ts'
-import { parseFrontmatter } from './store.ts'
+import { parseFrontmatter, TYPE_ORDER } from './store.ts'
 import { scopesForCwd } from './scope.ts'
 
 const MAX_INDEX_LINES = 200
@@ -33,12 +33,42 @@ export function installRecall(ctx, store, config) {
   }
   ctx.systemPrompt.context({ name: 'memory:index', order: config.recallOrder ?? 117, text: memoryContext })
 
+  // 语义相关性选择(对齐 Claude Code findRelevantMemories 的 LLM 选择):
+  // 组装阶段异步用 LLM 从候选清单中挑选 ≤5 条最相关的记忆正文注入;
+  // 按 (sessionId, query) 缓存,同一查询不重复调用;失败/超时回落关键词评分。
+  const selectionCache = new Map()
+  const selectRelevantAsync = async (context) => {
+    if (config.selectEnabled === false) return null
+    const session = context?.agent?.session
+    const cwd = session?.header?.cwd
+    const query = latestQueries.get(session?.id) ?? ''
+    const entries = readScopedEntries(store.root, scopedDirs(store, cwd))
+    if (entries.length <= 5 || !query) return null
+    const cacheKey = `${session?.id ?? ''}|${query}|${entries.length}|${entries[0]?.updated ?? ''}`
+    if (selectionCache.has(cacheKey)) return selectionCache.get(cacheKey)
+    const promise = selectRelevantByLlm(ctx, config, context, entries, query, 5)
+      .then((picked) => picked ?? null)
+      .catch(() => null)
+    selectionCache.set(cacheKey, promise)
+    if (selectionCache.size > 200) selectionCache.delete(selectionCache.keys().next().value)
+    return promise
+  }
+
   // Router Standard 会有意清空普通 contexts。该外层 waterfall 在所有预设
   // 过滤完成后恢复严格作用域记忆，既不改变首轮工具目录，也不破坏完整 persona。
   ctx.on('system-prompt/assemble', async (_assembly, context, next) => {
     const assembled = await next()
-    const text = memoryContext(context)
+    const session = context?.agent?.session
+    const cwd = session?.header?.cwd
+    const query = latestQueries.get(session?.id) ?? ''
+    const entries = readScopedEntries(store.root, scopedDirs(store, cwd))
+    const keywordPick = selectRelevant(entries, query, 5)
+    let text = buildRecallText(store, config, cwd, query, entries, keywordPick)
     if (!text) return assembled
+    const llmPick = await selectRelevantAsync(context)
+    if (llmPick && llmPick.length > 0) {
+      text = buildRecallText(store, config, cwd, query, entries, llmPick)
+    }
     return {
       ...assembled,
       contexts: [
@@ -80,16 +110,26 @@ export function recallText(store, config, cwd, query = '') {
 
   const dirs = scopedDirs(store, cwd)
   const entries = readScopedEntries(store.root, dirs)
+  const relevant = selectRelevant(entries, query, 5)
+  return buildRecallText(store, config, cwd, query, entries, relevant)
+}
 
+export function buildRecallText(store, config, cwd, query, entries, relevant) {
+  const dirs = scopedDirs(store, cwd)
   const lines = []
   for (const dir of dirs) {
     const scoped = entries.filter((entry) => entry.scope === dir)
     if (scoped.length === 0) continue
     lines.push(`## ${dir}`, '')
-    for (const memory of scoped) {
-      lines.push(`- [${memory.name}](${memory.rel})${memory.description ? ` — ${memory.description}` : ''}`)
+    for (const [type, label] of TYPE_ORDER) {
+      const typed = scoped.filter((entry) => (entry.type ?? 'reference') === type)
+      if (!typed.length) continue
+      lines.push(`### ${label}`, '')
+      for (const memory of typed) {
+        lines.push(`- [${memory.name}](${memory.rel})${memory.description ? ` — ${memory.description}` : ''}`)
+      }
+      lines.push('')
     }
-    lines.push('')
   }
 
   const maxIndexBytes = config.recallMaxBytes ?? DEFAULT_INDEX_BYTES
@@ -103,8 +143,7 @@ export function recallText(store, config, cwd, query = '') {
     '',
   ].join('\n')
   const index = truncateLines(lines, Math.max(maxIndexBytes - Buffer.byteLength(head), 0))
-  const relevant = selectRelevant(entries, query, 5)
-  const detail = renderRelevant(relevant, config.recallRelevantMaxBytes ?? DEFAULT_RELEVANT_BYTES)
+  const detail = renderRelevant(relevant ?? [], config.recallRelevantMaxBytes ?? DEFAULT_RELEVANT_BYTES)
   return head + index + detail
 }
 
@@ -176,6 +215,84 @@ function queryTerms(query) {
     for (let index = 0; index < run.length - 1; index++) terms.add(run.slice(index, index + 2))
   }
   return [...terms].slice(0, 24)
+}
+
+/**
+ * LLM 语义相关性选择(对齐 Claude Code findRelevantMemories):
+ * 让模型从候选清单(title+description)中挑选与当前查询最相关的 ≤limit 条记忆,
+ * 结果经白名单过滤防幻觉;任何异常由调用方回落关键词评分。
+ */
+const SELECT_SYSTEM = [
+  '你是记忆相关性选择器。根据用户当前查询，从候选记忆清单中挑选最相关的记忆条目。',
+  '只输出严格 JSON 数组，元素是候选条目的 id 字符串，例如 ["逆向/box_analysis"]。',
+  '最多挑 5 条；不相关的查询允许输出空数组 []。不要输出任何解释或代码块。',
+  '优先选择能直接帮助回答当前查询的记忆；项目记忆优先于通用记忆；与查询无关的不要选。',
+].join('\n')
+
+async function selectRelevantByLlm(ctx, config, context, entries, query, limit = 5) {
+  const llm = ctx.get?.('root')?.get?.('llm') ?? ctx.get?.('llm') ?? ctx.llm
+  if (!llm?.stream) return null
+  const sessionId = context?.agent?.session?.id
+  let provider = config.selectProvider || config.provider || undefined
+  let model = config.selectModel || config.model || undefined
+  if (!provider || !model) {
+    const agent = sessionId ? ctx.agents?.get?.(sessionId) : null
+    provider = provider ?? agent?.options?.provider ?? context?.agent?.options?.provider
+    model = model ?? agent?.options?.model ?? context?.agent?.options?.model
+  }
+  if (!provider || !model) return null
+
+  const manifest = entries
+    .map((e) => `- ${e.rel} [${e.type ?? 'reference'}] ${e.name}${e.description ? ` — ${e.description}` : ''}`)
+    .join('\n')
+  const prompt = `候选记忆清单：\n${manifest}\n\n当前用户查询：\n${query}\n\n输出相关记忆 id 的 JSON 数组。`
+  const controller = new AbortController()
+  const timeoutMs = Math.max(Number(config.selectTimeoutMs) > 0 ? Number(config.selectTimeoutMs) : 12_000, 2_000)
+  const timeout = setTimeout(() => controller.abort(), timeoutMs)
+  let text = ''
+  try {
+    const stream = await llm.stream({
+      provider,
+      model,
+      system: SELECT_SYSTEM,
+      messages: [{
+        id: crypto.randomUUID(),
+        role: 'user',
+        source: { kind: 'user' },
+        content: [{ type: 'text', text: prompt }],
+      }],
+      temperature: 0,
+      reasoningEffort: 'off',
+      maxTokens: 256,
+      signal: controller.signal,
+    })
+    for await (const chunk of stream) {
+      if (chunk?.type === 'text-delta') text += chunk.text ?? ''
+    }
+  } finally {
+    clearTimeout(timeout)
+  }
+  if (!text.trim()) return null
+  let ids = []
+  try {
+    const cleaned = text.trim().replace(/^```(?:json)?\s*/i, '').replace(/\s*```$/, '')
+    const start = cleaned.indexOf('[')
+    const end = cleaned.lastIndexOf(']')
+    const parsed = JSON.parse(start >= 0 && end > start ? cleaned.slice(start, end + 1) : cleaned)
+    if (Array.isArray(parsed)) ids = parsed.map(String)
+  } catch {
+    return null
+  }
+  // 白名单过滤防幻觉:只保留真实存在的条目
+  const byId = new Map(entries.map((e) => [e.rel.replace(/\.md$/i, ''), e]))
+  const picked = []
+  for (const id of ids) {
+    const normalized = String(id).replace(/\\/g, '/').replace(/\.md$/i, '')
+    const entry = byId.get(normalized) ?? entries.find((e) => e.rel.replace(/\.md$/i, '') === normalized || e.rel.endsWith(`/${normalized}.md`))
+    if (entry && !picked.includes(entry)) picked.push(entry)
+    if (picked.length >= limit) break
+  }
+  return picked
 }
 
 function renderRelevant(entries, maxBytes) {

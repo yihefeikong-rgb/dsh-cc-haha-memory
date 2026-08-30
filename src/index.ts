@@ -24,14 +24,18 @@ export const inject = ['tools', 'systemPrompt', 'agents', 'llm', 'settings']
 export const Config = z.object({
   storageDir: z.string().default(defaultStorageDir()).description('记忆存储目录(默认 ~/.dsh/memory)'),
   reviewEnabled: z.boolean().default(true).description('回合后自动记录'),
-  reviewInterval: z.natural().min(1).default(5).description('每 N 回合评审一次'),
-  reviewMaxTokens: z.natural().default(16384).description('单次评审输出上限(默认16384≈无上限;0=不传,部分provider会返回空;设小值时超出自动放大重试)'),
+  reviewInterval: z.natural().min(1).default(1).description('每 N 回合评审一次(对齐原版每轮提取)'),
+  reviewMaxTokens: z.natural().min(64).default(1000).description('单次评审输出上限'),
   reviewTimeoutMs: z.natural().min(1000).default(120000).description('自动记录评审总超时(ms)'),
   provider: z.string().default('').description('自动记录 provider(空=继承会话)'),
   model: z.string().default('').description('自动记录 model(空=继承会话)'),
   recallOrder: z.number().default(117).description('索引注入顺序'),
   recallMaxBytes: z.natural().min(1024).default(25000).description('注入索引上限字节'),
   recallRelevantMaxBytes: z.natural().min(1024).default(16000).description('相关记忆正文注入上限字节'),
+  selectEnabled: z.boolean().default(true).description('LLM 语义相关性选择(失败回落关键词评分)'),
+  selectProvider: z.string().default('').description('相关性选择 provider(空=继承会话)'),
+  selectModel: z.string().default('').description('相关性选择 model(空=继承会话)'),
+  selectTimeoutMs: z.natural().min(2000).default(12000).description('相关性选择超时(ms)'),
 })
 
 export function apply(ctx, config = {}) {

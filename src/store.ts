@@ -23,6 +23,15 @@ export const TYPE_DIRS = {
   archive: '归档',
 }
 
+/** 索引渲染顺序(对齐 Claude Code 四类型 + 归档)。 */
+export const TYPE_ORDER = [
+  ['user', '用户画像'],
+  ['feedback', '反馈'],
+  ['project', '项目状态'],
+  ['reference', '工具参考'],
+  ['archive', '归档'],
+]
+
 export const MEMORY_TYPES = ['user', 'feedback', 'project', 'reference', 'archive']
 
 export const INDEX_FILE = 'MEMORY.md'
@@ -52,7 +61,7 @@ export function parseFrontmatter(text) {
 /** 序列化为 Markdown + YAML frontmatter。 */
 export function serializeMemory(memory) {
   const lines = ['---']
-  if (memory.name) lines.push(`name: ${normalizeMemoryTitle(memory.name)}`)
+  if (memory.name) lines.push(`name: ${frontmatterLine(memory.name)}`)
   if (memory.description) lines.push(`description: ${frontmatterLine(memory.description)}`)
   if (memory.type) lines.push(`type: ${frontmatterLine(memory.type)}`)
   if (memory.created) lines.push(`created: ${frontmatterLine(memory.created)}`)
@@ -68,10 +77,6 @@ export function serializeMemory(memory) {
 
 function frontmatterLine(value) {
   return String(value ?? '').replace(/\r?\n/g, ' ').trim()
-}
-
-export function normalizeMemoryTitle(value) {
-  return frontmatterLine(value)
 }
 
 /** title → 文件名(保留中文,清理非法字符,截断)。 */
@@ -349,11 +354,16 @@ export class MemoryStore {
       const entries = groups.get(dir)
       if (!entries?.length) continue
       lines.push(`## ${dir}`, '')
-      for (const e of entries) {
-        const hook = e.description ? ` — ${e.description}` : ''
-        lines.push(`- [${e.title}](${e.rel})${hook}`)
+      for (const [type, label] of TYPE_ORDER) {
+        const typed = entries.filter((e) => (e.type ?? 'reference') === type)
+        if (!typed.length) continue
+        lines.push(`### ${label}`, '')
+        for (const e of typed) {
+          const hook = e.description ? ` — ${e.description}` : ''
+          lines.push(`- [${e.title}](${e.rel})${hook}`)
+        }
+        lines.push('')
       }
-      lines.push('')
     }
     await atomicWrite(join(this.root, INDEX_FILE), lines.join('\n'))
   }
