@@ -95,6 +95,8 @@ Read MEMORY.md → memory_remember → saved: true
 | `recallRelevantMaxBytes` | `16000` | **单次**相关正文最大字节数 |
 | `sessionMaxBytes` | `61440` | **本会话**相关正文累计上限（0=不限） |
 | `dedupeRelevant` | `true` | 同一会话内已注入过的正文不再重复注入 |
+| `relevantBodiesEnabled` | `true` | 是否按当前查询注入相关正文。**设 `false` = 每会话只在开场注入一次**：索引冻结 + 无正文 → 记忆块在会话内恒定，harness 不再逐轮追加注入；细节改用 `memory_search`/`memory_read` 取（这正是上游 cc-haha 的默认形态） |
+| `freezeIndexPerSession` | `true` | 索引片段每会话只渲染一次（对齐上游 `getUserContext` 的 memoize）。否则会话中途写记忆会让索引变化 → 多一次注入 |
 | `selectEnabled` | `true` | LLM 语义相关性选择（失败/关闭时回落关键词评分） |
 | `selectTimeoutMs` | `12000` | 相关性选择超时 |
 | `guidanceEnabled` | `true` | 把「引用记忆前的核验」指南注册成系统提示词的静态 section（内容不变 → 走前缀缓存） |

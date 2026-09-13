@@ -109,7 +109,8 @@ test('召回索引超过 200 行或字节上限时截断并告警', async () => 
 /** 构造最小 ctx/agent,并触发一次用户消息(设置当前 query)。 */
 function recallHarness(store, repo, config = {}) {
   const handlers = new Map()
-  const session = { id: 'session-budget', header: { cwd: repo } }
+  const surface = []
+  const session = { id: 'session-budget', header: { cwd: repo }, snapshotEvents: () => surface }
   const agent = { session, options: { provider: 'test-provider', model: 'test-model' } }
   const sections = []
   const contexts = []
@@ -132,17 +133,22 @@ function recallHarness(store, repo, config = {}) {
   }
   installRecall(ctx, store, config)
   const base = { sections: [], contexts: [], tools: [], variables: {} }
+  const userEvent = (text) => ({
+    type: 'user/message', seq: 1,
+    data: { id: 'm1', source: { kind: 'user' }, content: [{ type: 'text', text }] },
+  })
   return {
     agent,
     sections,
     contexts,
     llmCalls,
     say(text) {
-      handlers.get('session/event')(session, {
-        type: 'user/message', seq: 1,
-        data: { id: 'm1', source: { kind: 'user' }, content: [{ type: 'text', text }] },
-      })
+      const event = userEvent(text)
+      surface.push(event)
+      handlers.get('session/event')(session, event)
     },
+    /** 只把消息放进会话快照、不派发事件——模拟"assemble 早于 session/event 送达插件"。 */
+    surfaceOnly(text) { surface.push(userEvent(text)) },
     tool(name) {
       handlers.get('session/event')(session, { type: 'tool/call', data: { name } })
     },
@@ -162,6 +168,42 @@ test('把"引用记忆前的核验"指南注册成静态系统提示词 section(
     // 关掉时不注册
     const off = recallHarness(store, repo, { guidanceEnabled: false })
     assert.equal(off.sections.find((item) => item.name === 'memory:usage'), undefined)
+  })
+})
+
+test('索引片段在会话内冻结:中途新增记忆不会让注入文本再变一次', async () => {
+  await fixture(async ({ store, repo }) => {
+    await store.write({ title: 'alpha', description: 'alpha 主题', content: 'A alpha', type: 'project' }, { scope: 'za xiang' })
+    const h = recallHarness(store, repo, { selectEnabled: false })
+    h.say('alpha')
+    const first = (await h.assemble()).contexts[0].text
+    const indexOf = (t) => { const j = t.indexOf('# 与当前问题相关的记忆正文'); return j < 0 ? t : t.slice(0, j) }
+
+    // 会话中途新增一条记忆(等价于 agent 自己 memory_remember 或后台评审写入)
+    await store.write({ title: 'beta', description: 'beta 主题', content: 'B beta', type: 'project' }, { scope: 'za xiang' })
+    await new Promise((resolve) => setTimeout(resolve, 1100)) // 越过 entries 的 1s TTL，确保真的重读磁盘
+
+    h.say('beta')
+    const second = (await h.assemble()).contexts[0].text
+    assert.match(second, /B beta/, '前言:新记忆确实被读到了(否则本用例不成立)')
+    assert.equal(indexOf(second), indexOf(first), '索引片段应保持冻结,不因新增记忆而变化')
+    const third = (await h.assemble()).contexts[0].text
+    assert.equal(indexOf(third), indexOf(second))
+  })
+})
+
+test('freezeIndexPerSession=false 时索引会重渲染(反证上一条不是恒真)', async () => {
+  await fixture(async ({ store, repo }) => {
+    await store.write({ title: 'alpha', description: 'alpha 主题', content: 'A alpha', type: 'project' }, { scope: 'za xiang' })
+    const h = recallHarness(store, repo, { selectEnabled: false, freezeIndexPerSession: false })
+    h.say('alpha')
+    const first = (await h.assemble()).contexts[0].text
+    await store.write({ title: 'beta', description: 'beta 主题', content: 'B beta', type: 'project' }, { scope: 'za xiang' })
+    await new Promise((resolve) => setTimeout(resolve, 1100))
+    h.say('beta')
+    const second = (await h.assemble()).contexts[0].text
+    assert.notEqual(second, first)
+    assert.match(second, /beta 主题/, '关闭冻结后索引应立即反映新增记忆')
   })
 })
 
@@ -249,5 +291,21 @@ test('两条记忆都会被注入(去重不误伤首轮)', async () => {
     const text = (await h.assemble()).contexts[0].text
     assert.match(text, /ALPHA_BODY/)
     assert.match(text, /BETA_BODY/)
+  })
+})
+
+test('relevantBodiesEnabled=false 时整会话记忆块恒定(不再逐轮注入)', async () => {
+  await fixture(async ({ store, repo }) => {
+    await store.write({ title: 'alpha', description: 'alpha 主题', content: 'ALPHA_BODY alpha', type: 'project' }, { scope: 'za xiang' })
+    await store.write({ title: 'beta', description: 'beta 主题', content: 'BETA_BODY beta', type: 'project' }, { scope: 'za xiang' })
+    const h = recallHarness(store, repo, { selectEnabled: false, relevantBodiesEnabled: false })
+    h.say('alpha')
+    const first = (await h.assemble()).contexts[0].text
+    assert.doesNotMatch(first, /ALPHA_BODY/)
+    assert.match(first, /# 记忆索引/)
+    // 换查询后再组装:文本仍逐字节相同 → harness 不会再追加注入
+    h.say('beta')
+    const second = (await h.assemble()).contexts[0].text
+    assert.equal(second, first)
   })
 })

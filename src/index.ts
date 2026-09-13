@@ -34,6 +34,8 @@ export const Config = z.object({
   recallRelevantMaxBytes: z.natural().min(1024).default(16000).description('单次相关记忆正文注入上限字节'),
   sessionMaxBytes: z.natural().min(0).default(61440).description('本会话相关记忆正文累计注入上限字节(0=不限);对齐 CC-HAHA MAX_SESSION_BYTES=60KB'),
   dedupeRelevant: z.boolean().default(true).description('同一会话内已注入过的记忆正文不再重复注入(对齐 CC-HAHA alreadySurfaced)'),
+  relevantBodiesEnabled: z.boolean().default(true).description('是否按当前查询注入相关记忆正文;false=只给索引,整会话不再逐轮注入(细节用 memory_search/memory_read 取)'),
+  freezeIndexPerSession: z.boolean().default(true).description('索引片段在本会话内冻结一次(对齐上游 getUserContext 的 memoize);关闭则每次 assemble 重渲染'),
   guidanceEnabled: z.boolean().default(true).description('把"引用记忆前的核验"指南放进系统提示词的静态 section(对齐 CC-HAHA TRUSTING_RECALL/DRIFT_CAVEAT)'),
   guidanceOrder: z.number().default(118).description('使用指南 section 的排序位'),
   recentToolsEnabled: z.boolean().default(true).description('把"最近使用过的工具"传给相关性选择器,避免注入正在使用的工具的参考类记忆'),

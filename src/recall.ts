@@ -104,7 +104,7 @@ export function installRecall(ctx, store, config) {
     const key = String(sessionId ?? '')
     let state = sessionState.get(key)
     if (!state) {
-      state = { paths: new Set(), bytes: 0, decision: null }
+      state = { paths: new Set(), bytes: 0, decision: null, indexText: '' }
       sessionState.set(key, state)
       if (sessionState.size > 200) sessionState.delete(sessionState.keys().next().value)
     }
@@ -116,8 +116,11 @@ export function installRecall(ctx, store, config) {
   const memoryContext = (context) => {
     const session = context?.agent?.session
     const cwd = session?.header?.cwd
-    const query = latestQueries.get(session?.id) ?? ''
-    return buildRecallBundle(store, config, cwd, query, cachedEntries(cwd), [], 0).text || undefined
+    const state = stateFor(session?.id)
+    const frozen = config.freezeIndexPerSession === false ? undefined : (state.indexText || undefined)
+    const bundle = buildRecallBundle(store, config, cwd, (latestQueries.get(session?.id) ?? ''), cachedEntries(cwd), [], 0, frozen)
+    if (!state.indexText) state.indexText = bundle.indexText
+    return bundle.text || undefined
   }
   ctx.systemPrompt.context({ name: 'memory:index', order: config.recallOrder ?? 117, text: memoryContext })
 
@@ -161,7 +164,11 @@ export function installRecall(ctx, store, config) {
     // 6 步连注 6 次、把 60KB 预算在一步之内烧完)。因此按 (会话, 当前查询) 记住
     // 本回合的选择并原样复用: 同一查询下文本逐字节一致,harness 不会再追加,
     // 模型仍能从历史里看到上一份快照。对齐上游「每个用户回合只预取一次」。
-    const reused = state.decision && state.decision.query === query ? state.decision : null
+    // relevantBodiesEnabled=false: 不再注入「按当前查询挑的正文」,记忆块在会话内
+    // 完全恒定(索引已冻结 + 无正文) → harness 不会再追加注入;细节改由
+    // memory_search / memory_read 按需取(这正是上游默认形态:只给索引+工具)。
+    const bodiesEnabled = config.relevantBodiesEnabled !== false
+    const reused = bodiesEnabled && state.decision && state.decision.query === query ? state.decision : null
     let pick
     let bodyMax
     if (reused) {
@@ -174,13 +181,18 @@ export function installRecall(ctx, store, config) {
     } else {
       // 已注入过的记忆不再作为候选(选择器也因此不会在 5 个名额上重复挑旧条目)。
       const candidates = dedupe ? entries.filter((entry) => !state.paths.has(entry.rel)) : entries
-      pick = candidates.length ? selectRelevant(candidates, query, 5) : []
-      const llmPick = await selectRelevantAsync(context, candidates)
+      pick = bodiesEnabled && candidates.length ? selectRelevant(candidates, query, 5) : []
+      const llmPick = bodiesEnabled ? await selectRelevantAsync(context, candidates) : null
       if (llmPick && llmPick.length > 0) pick = llmPick
-      bodyMax = Math.min(Number(config.recallRelevantMaxBytes ?? DEFAULT_RELEVANT_BYTES), budgetLeft)
+      bodyMax = bodiesEnabled ? Math.min(Number(config.recallRelevantMaxBytes ?? DEFAULT_RELEVANT_BYTES), budgetLeft) : 0
     }
-    const bundle = buildRecallBundle(store, config, cwd, query, entries, pick, bodyMax)
+    // 索引片段在本会话内冻结(首个 assemble 渲染一次后复用):对齐上游 getUserContext
+    // 的 memoize 语义——上游索引也是"一次会话只算一次,只在 /clear 或 compact 时重算"。
+    // 否则会话中途写下/更新任何记忆都会让索引文本变化 → harness 再追加一次注入。
+    const bundle = buildRecallBundle(store, config, cwd, query, entries, pick, bodyMax,
+      config.freezeIndexPerSession === false ? undefined : (state.indexText || undefined))
     if (!bundle.text) return assembled
+    if (!state.indexText) state.indexText = bundle.indexText
     if (!reused) {
       if (dedupe) {
         for (const rel of bundle.included) state.paths.add(rel)
@@ -245,9 +257,9 @@ export function buildRecallText(store, config, cwd, query, entries, relevant, re
  *   bodyBytes = 实际注入的"相关正文"字节数(计入会话预算)
  *   included  = 正文确实进入文本的记忆路径(计入会话内去重)
  */
-function buildRecallBundle(store, config, cwd, query, entries, relevant, relevantMaxBytes) {
+function buildRecallBundle(store, config, cwd, query, entries, relevant, relevantMaxBytes, frozenIndexText) {
   if (IGNORE_MEMORY.test(String(query))) {
-    return { text: ignoreMemoryText(), bodyBytes: 0, included: [] }
+    return { text: ignoreMemoryText(), bodyBytes: 0, included: [], indexText: frozenIndexText }
   }
 
   const dirs = scopedDirs(store, cwd)
@@ -277,9 +289,10 @@ function buildRecallBundle(store, config, cwd, query, entries, relevant, relevan
     '用户要求忘记时，先搜索并确认目标，再使用 memory_delete。不要把当前计划、可从代码/Git 推断的信息或一次性调试过程写入长期记忆。',
     '',
   ].join('\n')
-  const index = truncateLines(lines, Math.max(maxIndexBytes - Buffer.byteLength(head), 0))
+  // 冻结时直接复用首轮渲染结果(见 installRecall 里的会话内索引冻结)。
+  const indexText = frozenIndexText ?? head + truncateLines(lines, Math.max(maxIndexBytes - Buffer.byteLength(head), 0))
   const detail = renderRelevant(relevant ?? [], relevantMaxBytes ?? config.recallRelevantMaxBytes ?? DEFAULT_RELEVANT_BYTES)
-  return { text: head + index + detail.text, bodyBytes: detail.bytes, included: detail.included }
+  return { text: indexText + detail.text, bodyBytes: detail.bytes, included: detail.included, indexText }
 }
 
 function readScopedEntries(root, dirs) {
