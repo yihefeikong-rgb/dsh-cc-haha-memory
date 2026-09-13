@@ -13,7 +13,7 @@ async function fixture(fn) {
   await mkdir(join(project, 'memory', '项目状态'), { recursive: true })
   await writeFile(join(project, 'session.jsonl'), `${JSON.stringify({ cwd: join(root, 'demo') })}\n`, 'utf8')
   await writeFile(join(project, 'memory', '项目状态', '事实.md'), '---\nname: 事实\ntype: project\n---\nClaude 原内容\n', 'utf8')
-  try { await fn({ projectsRoot, storageRoot }) } finally { await rm(root, { recursive: true, force: true }) }
+  try { await fn({ projectsRoot, storageRoot }) } finally { await rm(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 25 }) }
 }
 
 test('Claude 导入第二次启动不会覆盖 DSH 中的用户更新', async () => {

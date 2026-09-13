@@ -17,18 +17,19 @@ async function fixture(chunks, fn) {
   const repo = join(root, 'demo')
   await mkdir(join(repo, '.git'), { recursive: true })
   const warnings = []
+  const infos = []
   const calls = []
   const llm = { async stream(options) { calls.push(options); return typeof chunks === 'function' ? chunks() : streamOf(chunks) } }
   const agent = { options: { provider: 'test', model: 'memory-model' }, session: { header: { cwd: repo } } }
   const ctx = {
     agents: { get: () => agent },
     get: (name) => name === 'root' ? { get: (service) => service === 'llm' ? llm : null } : null,
-    logger: { info() {}, warn(message) { warnings.push(message) } },
+    logger: { info(message) { infos.push(message) }, warn(message) { warnings.push(message) } },
   }
   try {
-    await fn({ recorder: new TurnRecorder(ctx, new MemoryStore(memory), { reviewInterval: 1, reviewTimeoutMs: 2_000 }), memory, repo, warnings, calls })
+    await fn({ recorder: new TurnRecorder(ctx, new MemoryStore(memory), { reviewInterval: 1, reviewTimeoutMs: 2_000 }), memory, repo, warnings, infos, calls })
   } finally {
-    await rm(root, { recursive: true, force: true })
+    await rm(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 25 })
   }
 }
 
@@ -46,7 +47,7 @@ async function hangingFixture(fn) {
   try {
     await fn({ recorder: new TurnRecorder(ctx, new MemoryStore(join(root, 'memory')), { reviewTimeoutMs: 20 }), repo })
   } finally {
-    await rm(root, { recursive: true, force: true })
+    await rm(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 25 })
   }
 }
 
@@ -237,4 +238,128 @@ test('首次空输出自动重试，第二次成功才落盘', async () => {
     assert.equal(calls.length, 2, '应发起两次 LLM 调用')
     assert.equal(recorder.buffers.get('session-1').length, 0)
   })
+})
+
+async function waitFor(predicate, timeout = 2_000) {
+  const start = Date.now()
+  while (!predicate()) {
+    if (Date.now() - start > timeout) throw new Error('等待评审完成超时')
+    await new Promise((resolve) => setTimeout(resolve, 10))
+  }
+}
+
+test('REVIEW_SYSTEM 含保存门:显式保存请求不豁免排除项,要问出意外/非显然的部分', async () => {
+  await fixture([{ type: 'text-delta', text: '{"actions":[]}' }, { type: 'finish', reason: { kind: 'stop' } }], async ({ recorder, repo, calls }) => {
+    recorder.sessionCwds.set('session-1', repo)
+    recorder.pushMessage('session-1', 'user', '把这次的 PR 列表存进记忆')
+    assert.equal((await recorder.maybeReview('session-1')).status, 'none')
+    const system = calls[0].system
+    assert.match(system, /即使用户明确要求保存/)
+    assert.match(system, /意外|非显然/)
+    assert.match(system, /PR 列表|活动流水/)
+  })
+})
+
+test('本回合主 agent 写过记忆时跳过评审、清空缓冲且计数照旧推进', async () => {
+  await fixture([{ type: 'text-delta', text: '{"actions":[]}' }, { type: 'finish', reason: { kind: 'stop' } }], async ({ recorder, repo, calls, infos }) => {
+    recorder.sessionCwds.set('session-1', repo)
+    recorder.pushMessage('session-1', 'user', '记住技术选型')
+    recorder.handleEvent({ id: 'session-1' }, {
+      type: 'tool/call',
+      data: { turn: 1, step: 1, callId: 'call-1', name: 'memory_remember', arguments: '{"title":"技术选型"}' },
+    })
+    recorder.handleEvent({ id: 'session-1' }, { type: 'turn/end', data: { reason: { kind: 'completed' } } })
+    assert.equal(recorder.turnCounts.get('session-1'), 1, '计数应照旧推进')
+    assert.equal(recorder.buffers.has('session-1'), false, '缓冲应被清空(等价上游游标推进)')
+    assert.equal(recorder.agentWrote.has('session-1'), false, '标记应被清掉')
+    await new Promise((resolve) => setTimeout(resolve, 30))
+    assert.equal(calls.length, 0, '不应调用 LLM(评审被跳过)')
+    assert.ok(infos.some((message) => message.includes('AGENT_WROTE_MEMORY')), '应记录一条跳过说明')
+    assert.equal((await recorder.store.manifest(['demo'])).length, 0)
+  })
+})
+
+test('skipReviewAfterAgentWrite=false 时主 agent 写记忆后评审照常触发', async () => {
+  await fixture([{ type: 'text-delta', text: '{"actions":[]}' }, { type: 'finish', reason: { kind: 'stop' } }], async ({ recorder, repo, calls }) => {
+    recorder.config.skipReviewAfterAgentWrite = false
+    recorder.sessionCwds.set('session-1', repo)
+    recorder.pushMessage('session-1', 'user', '记住技术选型')
+    recorder.handleEvent({ id: 'session-1' }, {
+      type: 'tool/call',
+      data: { turn: 1, step: 1, callId: 'call-1', name: 'memory_remember', arguments: '{"title":"技术选型"}' },
+    })
+    recorder.handleEvent({ id: 'session-1' }, { type: 'turn/end', data: { reason: { kind: 'completed' } } })
+    assert.equal(recorder.turnCounts.get('session-1'), 1)
+    await waitFor(() => calls.length >= 1)
+    await waitFor(() => recorder.buffers.get('session-1')?.length === 0)
+    assert.ok(calls.length >= 1, '关掉开关后应照常评审')
+  })
+})
+
+test('主 agent 调用非记忆工具不影响评审', async () => {
+  await fixture([{ type: 'text-delta', text: '{"actions":[]}' }, { type: 'finish', reason: { kind: 'stop' } }], async ({ recorder, repo, calls }) => {
+    recorder.sessionCwds.set('session-1', repo)
+    recorder.pushMessage('session-1', 'user', '记住技术选型')
+    for (const name of ['bash', 'read', 'memory_search', 'memory_list']) {
+      recorder.handleEvent({ id: 'session-1' }, {
+        type: 'tool/call',
+        data: { turn: 1, step: 1, callId: `call-${name}`, name, arguments: '{}' },
+      })
+    }
+    recorder.handleEvent({ id: 'session-1' }, { type: 'turn/end', data: { reason: { kind: 'completed' } } })
+    assert.equal(recorder.buffers.get('session-1').length, 1, '不应清空缓冲')
+    await waitFor(() => calls.length >= 1)
+    await waitFor(() => recorder.buffers.get('session-1')?.length === 0)
+    assert.ok(calls.length >= 1, '非记忆工具不应阻止评审')
+  })
+})
+
+test('五个记忆写工具名都触发自我写入互斥', () => {
+  const infos = []
+  const ctx = { logger: { info(message) { infos.push(message) }, warn() {} } }
+  // memory_dream 由隔壁 dsh-dream 注册,但它同样会 create/update/delete 记忆文件,
+  // 上游判据是"有没有写记忆文件",因此一并纳入。
+  const writeTools = ['memory_remember', 'memory_write', 'memory_update', 'memory_delete', 'memory_dream']
+  for (const name of writeTools) {
+    const recorder = new TurnRecorder(ctx, {}, { reviewInterval: 1 })
+    const sessionId = `session-${name}`
+    recorder.sessionCwds.set(sessionId, 'D:/x/demo')
+    recorder.pushMessage(sessionId, 'user', '记住这个')
+    recorder.handleEvent({ id: sessionId }, {
+      type: 'tool/call',
+      data: { turn: 1, step: 1, callId: 'call-1', name, arguments: '{}' },
+    })
+    recorder.handleEvent({ id: sessionId }, { type: 'turn/end', data: { reason: { kind: 'completed' } } })
+    assert.equal(recorder.turnCounts.get(sessionId), 1, `${name} 应照旧推进计数`)
+    assert.equal(recorder.buffers.has(sessionId), false, `${name} 应清空缓冲`)
+    assert.equal(recorder.agentWrote.has(sessionId), false, `${name} 应清掉标记`)
+  }
+  assert.equal(infos.length, writeTools.length)
+  assert.ok(infos.every((message) => message.includes('AGENT_WROTE_MEMORY')))
+})
+
+test('非 completed 回合计入的写标记在下一个 completed 回合生效后清掉', async () => {
+  await fixture([{ type: 'text-delta', text: '{"actions":[]}' }, { type: 'finish', reason: { kind: 'stop' } }], async ({ recorder, repo, calls }) => {
+    recorder.sessionCwds.set('session-1', repo)
+    recorder.pushMessage('session-1', 'user', '记住技术选型')
+    recorder.handleEvent({ id: 'session-1' }, {
+      type: 'tool/call',
+      data: { turn: 1, step: 1, callId: 'call-1', name: 'memory_write', arguments: '{}' },
+    })
+    recorder.handleEvent({ id: 'session-1' }, { type: 'turn/end', data: { reason: { kind: 'error' } } })
+    assert.equal(recorder.turnCounts.get('session-1'), undefined, '中断回合不推进计数')
+    assert.equal(recorder.agentWrote.has('session-1'), true, '中断回合保留标记')
+    recorder.handleEvent({ id: 'session-1' }, { type: 'turn/end', data: { reason: { kind: 'completed' } } })
+    assert.equal(recorder.turnCounts.get('session-1'), 1)
+    await new Promise((resolve) => setTimeout(resolve, 30))
+    assert.equal(calls.length, 0, '缓冲含中断回合的写入,应一并跳过')
+    assert.equal(recorder.agentWrote.has('session-1'), false)
+  })
+})
+
+test('会话释放时清掉自我写入标记', () => {
+  const recorder = new TurnRecorder({}, {}, {})
+  recorder.agentWrote.add('session-1')
+  recorder.disposeSession('session-1')
+  assert.equal(recorder.agentWrote.has('session-1'), false)
 })

@@ -36,7 +36,7 @@ async function fixture(fn) {
   const store = new MemoryStore(join(root, 'memory'))
   const agents = { get: (id) => id === 'session-1' ? { session: { header: { cwd: repo } } } : undefined }
   const ctx = { get: (name) => name === 'agents' ? agents : undefined, agents }
-  try { await fn({ ctx, store }) } finally { await rm(root, { recursive: true, force: true }) }
+  try { await fn({ ctx, store }) } finally { await rm(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 25 }) }
 }
 
 test('API 只用 sessionId 反查项目并按项目写入', async () => {

@@ -13,9 +13,59 @@ const DEFAULT_RELEVANT_BYTES = 16_000
 const IGNORE_MEMORY = /(?:本次|本轮|这次)?.{0,4}(?:忽略|不要使用|不用|别用).{0,4}记忆|从零开始/u
 const EXPLICIT_REMEMBER = /(?:请|帮我|一定要|务必)?(?:记住|记一下|记下来|保存到记忆|以后(?:都|统一|一直).{0,12}(?:按|用|是|不要|别))/u
 
+/** 作用域内记忆文件列表的合并窗口(ms):同一 assemble 内多处读取复用同一次结果。 */
+const ENTRY_CACHE_TTL_MS = 1000
+/** 本会话"相关正文"累计注入上限(字节)。对齐上游 cc-haha 的 MAX_SESSION_BYTES=60KB。 */
+const DEFAULT_SESSION_BYTES = 60 * 1024
+
+/**
+ * 记忆使用指南(静态)。放在系统提示词的稳定 section 里,而不是每轮重新注入的尾部
+ * 快照——上游把"怎么用记忆"的规则放在 system prompt 的 memory section,内容不变
+ * 就能命中前缀缓存,不产生每轮开销。
+ * 上游原文(commit d52bbec7):
+ *   src/memdir/memoryTypes.ts:240-256 TRUSTING_RECALL_SECTION
+ *     "A memory that names a specific function, file, or flag is a claim that it existed
+ *      *when the memory was written*... If the memory names a file path: check the file
+ *      exists. If the memory names a function or flag: grep for it. If the user is about to
+ *      act on your recommendation ... verify first. 'The memory says X exists' is not the
+ *      same as 'X exists now.'"
+ *   src/memdir/memoryTypes.ts:201-202 MEMORY_DRIFT_CAVEAT
+ *     "Memory records can become stale over time... If a recalled memory conflicts with
+ *      current information, trust what you observe now — and update or remove the stale
+ *      memory rather than acting on it."
+ */
+const MEMORY_USAGE_GUIDANCE = [
+  '## 引用记忆前的核验',
+  '',
+  '记忆里提到某个函数、文件或开关，只代表**写下那条记忆时**它存在：它可能已被改名、删除，或从未合入。据此给出建议之前：',
+  '',
+  '- 记忆里给了文件路径 → 先确认该文件存在。',
+  '- 记忆里给了函数名或开关 → 先 grep 一遍。',
+  '- 用户准备照着你的建议动手（而不只是问历史）→ 先验证再答。',
+  '',
+  '「记忆说 X 存在」不等于「X 现在存在」。',
+  '',
+  '- 记忆会随时间过时：把它当成"某个时间点为真"的上下文；仅凭记忆作答或建立假设前，先读当前文件/资源的实际状态核实。',
+  '- 记忆与现状冲突时，以你现在观察到的为准——并顺手更新或删除那条过期记忆，而不是照着它行动。',
+  '- 记忆只是仓库状态的快照（活动记录、架构快照）时，若用户问的是近期/当前状态，优先 `git log` 或直接读代码。',
+].join('\n')
+
 export function installRecall(ctx, store, config) {
   const latestQueries = new Map()
+  // 本会话最近调用过的工具名(最近在前、去重)。传给相关性选择器用——上游
+  // findRelevantMemories 的提示词会让模型避开"正在使用的工具"的用法/API 文档类记忆。
+  const recentToolsBySession = new Map()
+  const toolsWindow = Math.max(0, Number(config.recentToolsWindow ?? 8))
   ctx.on('session/event', (session, event) => {
+    if (event?.type === 'tool/call' && session?.id) {
+      const name = typeof event.data?.name === 'string' ? event.data.name : ''
+      if (name && toolsWindow > 0) {
+        const list = recentToolsBySession.get(session.id) ?? []
+        recentToolsBySession.set(session.id, [name, ...list.filter((item) => item !== name)].slice(0, toolsWindow))
+        if (recentToolsBySession.size > 500) recentToolsBySession.delete(recentToolsBySession.keys().next().value)
+      }
+      return
+    }
     if (event?.type !== 'user/message' || event.data?.source?.kind !== 'user') return
     const text = extractEventText(event.data)
     if (text && session?.id) {
@@ -25,11 +75,49 @@ export function installRecall(ctx, store, config) {
     }
   }, { global: true })
 
+  // 静态使用指南进系统提示词 section(与上游一致);旧宿主没有 section() 时静默跳过。
+  if (config.guidanceEnabled !== false) {
+    try {
+      ctx.systemPrompt?.section?.({ name: 'memory:usage', order: Number(config.guidanceOrder ?? 118), text: MEMORY_USAGE_GUIDANCE })
+    } catch (error) {
+      ctx.logger?.warn?.(`[dsh-memory] 使用指南 section 注册失败(已忽略): ${error instanceof Error ? error.message : String(error)}`)
+    }
+  }
+
+  // 作用域内全部记忆文件。原本注册回调、assemble hook、语义选择器各读一次全量
+  // (本机 170 个 .md × 3 次/步),这里用 1s TTL 合并成 1 次。窗口内索引最多滞后
+  // 一步,对记忆目录这种写频率极低的场景可接受。
+  let entryCache = { key: '', at: 0, entries: [] }
+  const cachedEntries = (cwd) => {
+    const key = `${store.root}|${cwd ?? ''}`
+    if (entryCache.key === key && Date.now() - entryCache.at < ENTRY_CACHE_TTL_MS) return entryCache.entries
+    const entries = readScopedEntries(store.root, scopedDirs(store, cwd))
+    entryCache = { key, at: Date.now(), entries }
+    return entries
+  }
+
+  // 本会话已注入过的记忆正文路径 + 已用字节数。对齐上游 cc-haha 的
+  // alreadySurfaced + MAX_SESSION_BYTES:每条正文只在首次命中时注入,整会话累计
+  // 到预算后只保留索引,避免长会话每轮把同样的正文重灌进上下文。
+  const sessionState = new Map()
+  const stateFor = (sessionId) => {
+    const key = String(sessionId ?? '')
+    let state = sessionState.get(key)
+    if (!state) {
+      state = { paths: new Set(), bytes: 0, decision: null }
+      sessionState.set(key, state)
+      if (sessionState.size > 200) sessionState.delete(sessionState.keys().next().value)
+    }
+    return state
+  }
+
+  // 注册回调只产出索引(正文统一由下面的 assemble hook 产出并记账),避免同一份
+  // 内容被两处重复生成;hook 若被某种预设整体清空 contexts,至少索引仍在。
   const memoryContext = (context) => {
     const session = context?.agent?.session
     const cwd = session?.header?.cwd
     const query = latestQueries.get(session?.id) ?? ''
-    return recallText(store, config, cwd, query) || undefined
+    return buildRecallBundle(store, config, cwd, query, cachedEntries(cwd), [], 0).text || undefined
   }
   ctx.systemPrompt.context({ name: 'memory:index', order: config.recallOrder ?? 117, text: memoryContext })
 
@@ -37,16 +125,18 @@ export function installRecall(ctx, store, config) {
   // 组装阶段异步用 LLM 从候选清单中挑选 ≤5 条最相关的记忆正文注入;
   // 按 (sessionId, query) 缓存,同一查询不重复调用;失败/超时回落关键词评分。
   const selectionCache = new Map()
-  const selectRelevantAsync = async (context) => {
+  const selectRelevantAsync = async (context, entries) => {
     if (config.selectEnabled === false) return null
     const session = context?.agent?.session
-    const cwd = session?.header?.cwd
     const query = latestQueries.get(session?.id) ?? ''
-    const entries = readScopedEntries(store.root, scopedDirs(store, cwd))
     if (entries.length <= 5 || !query) return null
-    const cacheKey = `${session?.id ?? ''}|${query}|${entries.length}|${entries[0]?.updated ?? ''}`
+    // 上游 findRelevantMemories 会把"最近使用过的工具"一并交给选择器(默认开启)。
+    const tools = config.recentToolsEnabled === false
+      ? []
+      : (recentToolsBySession.get(session?.id) ?? [])
+    const cacheKey = `${session?.id ?? ''}|${query}|${entries.length}|${entries[0]?.updated ?? ''}|${tools.join(',')}`
     if (selectionCache.has(cacheKey)) return selectionCache.get(cacheKey)
-    const promise = selectRelevantByLlm(ctx, config, context, entries, query, 5)
+    const promise = selectRelevantByLlm(ctx, config, context, entries, query, 5, tools)
       .then((picked) => picked ?? null)
       .catch(() => null)
     selectionCache.set(cacheKey, promise)
@@ -61,19 +151,48 @@ export function installRecall(ctx, store, config) {
     const session = context?.agent?.session
     const cwd = session?.header?.cwd
     const query = latestQueries.get(session?.id) ?? ''
-    const entries = readScopedEntries(store.root, scopedDirs(store, cwd))
-    const keywordPick = selectRelevant(entries, query, 5)
-    let text = buildRecallText(store, config, cwd, query, entries, keywordPick)
-    if (!text) return assembled
-    const llmPick = await selectRelevantAsync(context)
-    if (llmPick && llmPick.length > 0) {
-      text = buildRecallText(store, config, cwd, query, entries, llmPick)
+    const entries = cachedEntries(cwd)
+    const state = stateFor(session?.id)
+    const dedupe = config.dedupeRelevant !== false
+    const sessionMax = Number(config.sessionMaxBytes ?? DEFAULT_SESSION_BYTES)
+    const budgetLeft = sessionMax <= 0 ? Number.POSITIVE_INFINITY : Math.max(0, sessionMax - state.bytes)
+    // 一个用户回合内有多个 step,每个 step 都会重新 assemble。若每次都重新挑一批
+    // 正文,快照文本每步都变 → harness 每步都追加一次 runtime context 注入(实测
+    // 6 步连注 6 次、把 60KB 预算在一步之内烧完)。因此按 (会话, 当前查询) 记住
+    // 本回合的选择并原样复用: 同一查询下文本逐字节一致,harness 不会再追加,
+    // 模型仍能从历史里看到上一份快照。对齐上游「每个用户回合只预取一次」。
+    const reused = state.decision && state.decision.query === query ? state.decision : null
+    let pick
+    let bodyMax
+    if (reused) {
+      // 必须按上次的**相关度顺序**还原(顺序不同会让文本逐字节变化),
+      // 并且复用原始 pick 而不是 only-included:预算截断到"一条都没进正文"时,
+      // 只有用原始 pick 才能复现出同样的截断提示,文本才真正逐字节一致。
+      const byRel = new Map(entries.map((entry) => [entry.rel, entry]))
+      pick = reused.picked.map((rel) => byRel.get(rel)).filter(Boolean)
+      bodyMax = reused.bodyMax
+    } else {
+      // 已注入过的记忆不再作为候选(选择器也因此不会在 5 个名额上重复挑旧条目)。
+      const candidates = dedupe ? entries.filter((entry) => !state.paths.has(entry.rel)) : entries
+      pick = candidates.length ? selectRelevant(candidates, query, 5) : []
+      const llmPick = await selectRelevantAsync(context, candidates)
+      if (llmPick && llmPick.length > 0) pick = llmPick
+      bodyMax = Math.min(Number(config.recallRelevantMaxBytes ?? DEFAULT_RELEVANT_BYTES), budgetLeft)
+    }
+    const bundle = buildRecallBundle(store, config, cwd, query, entries, pick, bodyMax)
+    if (!bundle.text) return assembled
+    if (!reused) {
+      if (dedupe) {
+        for (const rel of bundle.included) state.paths.add(rel)
+        state.bytes += bundle.bodyBytes
+      }
+      state.decision = { query, picked: pick.map((entry) => entry.rel), rels: bundle.included, bodyMax }
     }
     return {
       ...assembled,
       contexts: [
         ...assembled.contexts.filter((item) => item.name !== 'memory:index'),
-        { name: 'memory:index', text },
+        { name: 'memory:index', text: bundle.text },
       ],
     }
   }, { global: true, prepend: true })
@@ -104,17 +223,33 @@ export function scopedDirs(store, cwd) {
 }
 
 export function recallText(store, config, cwd, query = '') {
-  if (IGNORE_MEMORY.test(String(query))) {
-    return '# 本轮已忽略记忆\n\n用户要求本轮不使用历史记忆；不要依据记忆内容作答。'
-  }
+  if (IGNORE_MEMORY.test(String(query))) return ignoreMemoryText()
 
   const dirs = scopedDirs(store, cwd)
   const entries = readScopedEntries(store.root, dirs)
   const relevant = selectRelevant(entries, query, 5)
-  return buildRecallText(store, config, cwd, query, entries, relevant)
+  return buildRecallBundle(store, config, cwd, query, entries, relevant).text
 }
 
-export function buildRecallText(store, config, cwd, query, entries, relevant) {
+function ignoreMemoryText() {
+  return '# 本轮已忽略记忆\n\n用户要求本轮不使用历史记忆；不要依据记忆内容作答。'
+}
+
+export function buildRecallText(store, config, cwd, query, entries, relevant, relevantMaxBytes) {
+  return buildRecallBundle(store, config, cwd, query, entries, relevant, relevantMaxBytes).text
+}
+
+/**
+ * 组装记忆文本并返回记账信息:
+ *   text      = 规则头 + 索引 + 相关正文
+ *   bodyBytes = 实际注入的"相关正文"字节数(计入会话预算)
+ *   included  = 正文确实进入文本的记忆路径(计入会话内去重)
+ */
+function buildRecallBundle(store, config, cwd, query, entries, relevant, relevantMaxBytes) {
+  if (IGNORE_MEMORY.test(String(query))) {
+    return { text: ignoreMemoryText(), bodyBytes: 0, included: [] }
+  }
+
   const dirs = scopedDirs(store, cwd)
   const lines = []
   for (const dir of dirs) {
@@ -143,8 +278,8 @@ export function buildRecallText(store, config, cwd, query, entries, relevant) {
     '',
   ].join('\n')
   const index = truncateLines(lines, Math.max(maxIndexBytes - Buffer.byteLength(head), 0))
-  const detail = renderRelevant(relevant ?? [], config.recallRelevantMaxBytes ?? DEFAULT_RELEVANT_BYTES)
-  return head + index + detail
+  const detail = renderRelevant(relevant ?? [], relevantMaxBytes ?? config.recallRelevantMaxBytes ?? DEFAULT_RELEVANT_BYTES)
+  return { text: head + index + detail.text, bodyBytes: detail.bytes, included: detail.included }
 }
 
 function readScopedEntries(root, dirs) {
@@ -227,9 +362,14 @@ const SELECT_SYSTEM = [
   '只输出严格 JSON 数组，元素是候选条目的 id 字符串，例如 ["逆向/box_analysis"]。',
   '最多挑 5 条；不相关的查询允许输出空数组 []。不要输出任何解释或代码块。',
   '优先选择能直接帮助回答当前查询的记忆；项目记忆优先于通用记忆；与查询无关的不要选。',
+  // 以下两条对齐上游 cc-haha 的选择器提示词(commit d52bbec7,
+  // src/memdir/findRelevantMemories.ts:18-24)。上游用 json_schema 强制结构化输出,
+  // DSH 的 llm.stream 没有 output_format,因此改为把同一约束写进提示词。
+  '只挑你有把握确实有帮助的条目；不确定就不要挑，宁可返回空数组——要挑剔、要有判断力。',
+  '若给出了「最近使用过的工具」：不要挑这些工具的用法/API 参考类记忆（对话里已经在用了）；但要挑包含**坑、警告、已知问题**的此类记忆。',
 ].join('\n')
 
-async function selectRelevantByLlm(ctx, config, context, entries, query, limit = 5) {
+async function selectRelevantByLlm(ctx, config, context, entries, query, limit = 5, recentTools = []) {
   const llm = ctx.get?.('root')?.get?.('llm') ?? ctx.get?.('llm') ?? ctx.llm
   if (!llm?.stream) return null
   const sessionId = context?.agent?.session?.id
@@ -245,7 +385,10 @@ async function selectRelevantByLlm(ctx, config, context, entries, query, limit =
   const manifest = entries
     .map((e) => `- ${e.rel} [${e.type ?? 'reference'}] ${e.name}${e.description ? ` — ${e.description}` : ''}`)
     .join('\n')
-  const prompt = `候选记忆清单：\n${manifest}\n\n当前用户查询：\n${query}\n\n输出相关记忆 id 的 JSON 数组。`
+  const toolsSection = Array.isArray(recentTools) && recentTools.length > 0
+    ? `\n\n最近使用过的工具：${recentTools.join(', ')}`
+    : ''
+  const prompt = `候选记忆清单：\n${manifest}\n\n当前用户查询：\n${query}${toolsSection}\n\n输出相关记忆 id 的 JSON 数组。`
   const controller = new AbortController()
   const timeoutMs = Math.max(Number(config.selectTimeoutMs) > 0 ? Number(config.selectTimeoutMs) : 12_000, 2_000)
   const timeout = setTimeout(() => controller.abort(), timeoutMs)
@@ -296,7 +439,7 @@ async function selectRelevantByLlm(ctx, config, context, entries, query, limit =
 }
 
 function renderRelevant(entries, maxBytes) {
-  if (entries.length === 0 || maxBytes <= 0) return ''
+  if (entries.length === 0 || maxBytes <= 0) return { text: '', bytes: 0, included: [] }
   const lines = ['', '# 与当前问题相关的记忆正文', '']
   for (const entry of entries) {
     lines.push(`## ${entry.name}（${entry.scope}）`)
@@ -306,7 +449,13 @@ function renderRelevant(entries, maxBytes) {
     }
     lines.push(entry.body, '')
   }
-  return truncateByBytes(lines.join('\n'), maxBytes)
+  const text = truncateByBytes(lines.join('\n'), maxBytes)
+  // 只有标题行确实进了文本的记忆才算"已注入"(被截断掉的仍可后续再选)。
+  const included = []
+  for (const entry of entries) {
+    if (text.includes(`## ${entry.name}（${entry.scope}）`)) included.push(entry.rel)
+  }
+  return { text, bytes: Buffer.byteLength(text), included }
 }
 
 function memoryAgeDays(value) {

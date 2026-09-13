@@ -11,7 +11,7 @@ async function withStore(fn) {
   try {
     await fn(new MemoryStore(dir))
   } finally {
-    await rm(dir, { recursive: true, force: true })
+    await rm(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 25 })
   }
 }
 
@@ -139,5 +139,28 @@ test('拒绝路径穿越和非法作用域', async () => {
   await withStore(async (store) => {
     await assert.rejects(store.write({ title: 'x', content: 'x' }, { scope: '../outside' }), /无效记忆作用域/)
     await assert.rejects(store.get('../outside'), /无效记忆 id/)
+  })
+})
+
+test('索引覆盖前会备份上一版到 .history/_index', async () => {
+  await withStore(async (store) => {
+    await store.write({ title: 'A', content: 'a', type: 'project' }, { scope: 'demo' })
+    const previous = await store.readIndex()
+    assert.ok(previous.includes('A'))
+    // 第二次写入会重写索引 → 旧索引应先落一份备份
+    await store.write({ title: 'B', content: 'b', type: 'project' }, { scope: 'demo' })
+    const dir = join(store.root, '.history', '_index')
+    const files = (await readdir(dir)).filter((name) => name.startsWith(`${INDEX_FILE}.`))
+    assert.ok(files.length >= 1, '应至少有一份索引备份')
+    const contents = await Promise.all(files.map((name) => readFile(join(dir, name), 'utf8')))
+    assert.ok(contents.includes(previous), '备份内容应等于上一版索引')
+    // 索引相对最新备份已变化 → 再刷新一次补一份备份
+    await store.refreshIndex()
+    const mid = (await readdir(dir)).filter((name) => name.startsWith(`${INDEX_FILE}.`))
+    assert.equal(mid.length, files.length + 1)
+    // 内容与最新备份相同 → 不再产生新备份
+    await store.refreshIndex()
+    const after = (await readdir(dir)).filter((name) => name.startsWith(`${INDEX_FILE}.`))
+    assert.equal(after.length, mid.length)
   })
 })

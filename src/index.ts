@@ -31,11 +31,18 @@ export const Config = z.object({
   model: z.string().default('').description('自动记录 model(空=继承会话)'),
   recallOrder: z.number().default(117).description('索引注入顺序'),
   recallMaxBytes: z.natural().min(1024).default(25000).description('注入索引上限字节'),
-  recallRelevantMaxBytes: z.natural().min(1024).default(16000).description('相关记忆正文注入上限字节'),
+  recallRelevantMaxBytes: z.natural().min(1024).default(16000).description('单次相关记忆正文注入上限字节'),
+  sessionMaxBytes: z.natural().min(0).default(61440).description('本会话相关记忆正文累计注入上限字节(0=不限);对齐 CC-HAHA MAX_SESSION_BYTES=60KB'),
+  dedupeRelevant: z.boolean().default(true).description('同一会话内已注入过的记忆正文不再重复注入(对齐 CC-HAHA alreadySurfaced)'),
+  guidanceEnabled: z.boolean().default(true).description('把"引用记忆前的核验"指南放进系统提示词的静态 section(对齐 CC-HAHA TRUSTING_RECALL/DRIFT_CAVEAT)'),
+  guidanceOrder: z.number().default(118).description('使用指南 section 的排序位'),
+  recentToolsEnabled: z.boolean().default(true).description('把"最近使用过的工具"传给相关性选择器,避免注入正在使用的工具的参考类记忆'),
+  recentToolsWindow: z.natural().min(0).default(8).description('"最近使用过的工具"保留个数(0=不传)'),
   selectEnabled: z.boolean().default(true).description('LLM 语义相关性选择(失败回落关键词评分)'),
   selectProvider: z.string().default('').description('相关性选择 provider(空=继承会话)'),
   selectModel: z.string().default('').description('相关性选择 model(空=继承会话)'),
   selectTimeoutMs: z.natural().min(2000).default(12000).description('相关性选择超时(ms)'),
+  skipReviewAfterAgentWrite: z.boolean().default(true).description('本回合主 agent 自己写过记忆时，跳过该回合的后台评审(对齐上游 hasMemoryWritesSince)'),
 })
 
 export function apply(ctx, config = {}) {

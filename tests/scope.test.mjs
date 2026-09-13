@@ -14,7 +14,7 @@ async function fixture(fn) {
   try {
     await fn({ root, memory, repo })
   } finally {
-    await rm(root, { recursive: true, force: true })
+    await rm(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 25 })
   }
 }
 

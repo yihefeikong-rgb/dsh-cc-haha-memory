@@ -15,7 +15,7 @@ async function fixture(fn) {
   const ctx = { tools: { register(tool) { registered.set(tool.name, tool) } }, logger: { info() {} } }
   registerMemoryTools(ctx, store)
   const exec = { agent: { session: { header: { cwd: repo } } } }
-  try { await fn({ store, registered, exec }) } finally { await rm(root, { recursive: true, force: true }) }
+  try { await fn({ store, registered, exec }) } finally { await rm(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 25 }) }
 }
 
 test('memory_write 默认写当前项目，明确 general 才写通用', async () => {

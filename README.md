@@ -10,7 +10,7 @@
 - **真实记住**：用户明确说“记住”时，DSH 会先读取记忆索引，再显示 `memory_remember` 工具调用；只有返回 `saved: true` 后才确认已记住。
 - **独立文件**：每条记忆保存为单独的 Markdown 文件，并由 `MEMORY.md` 维护简洁索引。
 - **项目隔离**：每次只注入“通用 + 当前项目”，不会把所有项目记忆一次性塞进上下文。
-- **新会话召回**：按当前问题选择最多 5 条相关记忆正文，无需每次手动搜索。
+- **逐轮召回 + 会话预算**：每条提示词按当前问题选择最多 5 条相关记忆正文注入；同一会话内**已注入过的记忆不重复注入**，整会话累计超过 `sessionMaxBytes`（默认 60KB）后只保留索引——对齐 CC-HAHA 的 `alreadySurfaced` + `MAX_SESSION_BYTES`。
 - **自动记录**：按回合评审值得长期保存的信息，失败时保留缓冲，不把模型错误伪装成“没有记忆”。
 - **安全更新**：同主题通过明确记忆 ID 更新；禁止模糊标题猜测覆盖，更新和删除前保存历史版本。
 - **管理界面**：会话页上方提供“记忆”标签、项目文件夹、搜索、新建、编辑和删除。
@@ -88,10 +88,25 @@ Read MEMORY.md → memory_remember → saved: true
 | 选项 | 默认值 | 说明 |
 |---|---:|---|
 | `reviewEnabled` | `true` | 是否启用回合后自动评审 |
-| `reviewInterval` | `5` | 每多少回合评审一次 |
+| `reviewInterval` | `1`（schema）/ `5`（本包 patch） | 每多少回合评审一次 |
 | `reviewTimeoutMs` | `120000` | 后台评审总超时 |
-| `recallMaxBytes` | `25000` | 注入索引最大字节数 |
-| `recallRelevantMaxBytes` | `16000` | 相关正文最大字节数 |
+| `recallOrder` | `117` | 索引 context 的注入顺序 |
+| `recallMaxBytes` | `25000` | 注入索引最大字节数（另有 200 行硬上限） |
+| `recallRelevantMaxBytes` | `16000` | **单次**相关正文最大字节数 |
+| `sessionMaxBytes` | `61440` | **本会话**相关正文累计上限（0=不限） |
+| `dedupeRelevant` | `true` | 同一会话内已注入过的正文不再重复注入 |
+| `selectEnabled` | `true` | LLM 语义相关性选择（失败/关闭时回落关键词评分） |
+| `selectTimeoutMs` | `12000` | 相关性选择超时 |
+| `guidanceEnabled` | `true` | 把「引用记忆前的核验」指南注册成系统提示词的静态 section（内容不变 → 走前缀缓存） |
+| `recentToolsEnabled` | `true` | 把「最近使用过的工具」交给选择器，避免注入正在使用的工具的参考类记忆 |
+| `recentToolsWindow` | `8` | 「最近使用过的工具」保留个数 |
+| `skipReviewAfterAgentWrite` | `true` | 本回合主 agent 自己写过记忆时跳过该回合的后台评审（对齐上游 `hasMemoryWritesSince`） |
+
+> 索引（`MEMORY.md`）每次被重写前会先备份上一版到 `~/.dsh/memory/.history/_index/`，只保留最近 20 份。
+> 「引用记忆前的核验」指南与「最近用过的工具」排除规则对齐上游 cc-haha 的
+> `TRUSTING_RECALL_SECTION` / `MEMORY_DRIFT_CAVEAT`（`src/memdir/memoryTypes.ts`）与
+> `findRelevantMemories` 的选择器提示词；上游选择器用 `json_schema` 强制结构化输出，
+> DSH 的 `llm.stream` 无此能力，故改为把同一约束写进提示词。
 
 ## 记忆工具
 

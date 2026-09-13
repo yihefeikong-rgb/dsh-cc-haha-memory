@@ -34,6 +34,9 @@ export const TYPE_ORDER = [
 
 export const MEMORY_TYPES = ['user', 'feedback', 'project', 'reference', 'archive']
 
+/** 索引历史版本保留份数(见 backupIndexUnlocked)。 */
+const INDEX_HISTORY_KEEP = 20
+
 export const INDEX_FILE = 'MEMORY.md'
 
 /** 默认记忆根目录。 */
@@ -77,6 +80,16 @@ export function serializeMemory(memory) {
 
 function frontmatterLine(value) {
   return String(value ?? '').replace(/\r?\n/g, ' ').trim()
+}
+
+/**
+ * 标题归一化:与 frontmatter 落盘时同一套处理(换行折成空格 + trim),
+ * 这样"是否是同一个标题"的判定与持久化后的结果一致。
+ * 用于 slug 撞名检测——slugify 会把标题截断到 48 字符,截断后相同
+ * 但完整标题不同的两条记忆绝不能互相覆盖。
+ */
+export function normalizeMemoryTitle(value) {
+  return frontmatterLine(value)
 }
 
 /** title → 文件名(保留中文,清理非法字符,截断)。 */
@@ -245,6 +258,35 @@ export class MemoryStore {
     await writeFile(abs, text, 'utf8')
   }
 
+  /**
+   * 索引备份:MEMORY.md 每次写入都是原子覆盖,而 dsh-memory 和 dsh-dream
+   * 都会重建它 —— 一旦写坏没有任何回退点。覆盖前把**旧内容**best-effort
+   * 备份到 .history/_index/MEMORY.md.<ISO>.md,内容与上一份相同则不产生新文件,
+   * 只保留最近 INDEX_HISTORY_KEEP 份。备份失败绝不影响主流程。
+   */
+  async backupIndexUnlocked(previous) {
+    try {
+      if (!previous || !previous.trim()) return
+      const dir = join(this.root, '.history', '_index')
+      await mkdir(dir, { recursive: true })
+      const list = async () => (await readdir(dir)).filter((f) => f.startsWith(`${INDEX_FILE}.`)).sort()
+      const before = await list()
+      const newest = before.length
+        ? await readFile(join(dir, before[before.length - 1]), 'utf8').catch(() => '')
+        : ''
+      if (newest !== previous) {
+        const ts = new Date().toISOString().replace(/[:.]/g, '-')
+        await writeFile(join(dir, `${INDEX_FILE}.${ts}.md`), previous, 'utf8')
+      }
+      const after = await list()
+      for (const stale of after.slice(0, Math.max(0, after.length - INDEX_HISTORY_KEEP))) {
+        await unlink(join(dir, stale)).catch(() => {})
+      }
+    } catch {
+      /* 备份失败不能影响索引写入 */
+    }
+  }
+
   /** 全文关键词搜索:标题/描述/内容分词评分。 */
   async search(query, opts = {}) {
     const q = String(query ?? '').trim().toLowerCase()
@@ -365,6 +407,8 @@ export class MemoryStore {
         lines.push('')
       }
     }
+    // 覆盖前先备份旧索引(索引没有任何其他回退点)。
+    await this.backupIndexUnlocked(await this.readIndex())
     await atomicWrite(join(this.root, INDEX_FILE), lines.join('\n'))
   }
 

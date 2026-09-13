@@ -3,10 +3,25 @@ import { extractEventText } from './events.ts'
 import { parseTags, slugify } from './store.ts'
 import { GENERAL_SCOPE, resolveProjectScope } from './scope.ts'
 
-const REVIEWABLE_KINDS = new Set(['completed', 'max-tokens', 'error'])
+/** 只有终态 completed 的 turn/end 才算一个可用回合:error/max-tokens 等中断回合不进评审。 */
+const REVIEWABLE_KINDS = new Set(['completed'])
+/**
+ * 记忆写工具名。主 agent 本回合调用过其中任一 → 本回合不再跑后台提取
+ * (对齐上游 hasMemoryWritesSince 的自我写入互斥)。上游判据是"有没有写记忆文件",
+ * 因此除本仓 tools.ts 里的写工具外,把隔壁 dsh-dream 注册的 `memory_dream`
+ * (它同样会 create/update/delete 记忆文件)一并纳入。
+ */
+const MEMORY_WRITE_TOOLS = new Set(['memory_remember', 'memory_write', 'memory_update', 'memory_delete', 'memory_dream'])
 const MAX_MESSAGE_CHARS = 8_000
 const MAX_BUFFER_MESSAGES = 50
 
+/**
+ * 保存门(对齐 cc-haha v0.5.4 src/memdir/memoryTypes.ts:192-194，上游注明经评测验证：
+ * memory-prompt-iteration case 3，0/2 → 3/3)。上游英文原文：
+ *   These exclusions apply even when the user explicitly asks you to save. If they ask you to save a PR list
+ *   or activity summary, ask what is *surprising* or *non-obvious* about it — that is the part worth keeping.
+ * 即：排除项优先于用户的显式保存请求；显式保存请求要落到"意外/非显然"的部分，而不是原文搬运。
+ */
 const REVIEW_SYSTEM = [
   '你是项目记忆提取器。只输出严格 JSON，不要输出代码块或解释。',
   '格式：{"actions":[{"action":"create|update|delete","id":"更新/删除时必填","type":"user|feedback|project|reference","title":"创建时必填","content":"创建/更新正文","description":"一行索引说明","tags":["标签"]}]}。',
@@ -18,6 +33,8 @@ const REVIEW_SYSTEM = [
   '- reference: 指向外部系统的指针——仪表板、工单系统、工具用法、外部资源位置',
   '必须保存：跨会话仍有价值的用户画像、行为反馈、项目决策/状态、外部系统与工具引用。',
   '不要保存：能从当前代码/Git/计划直接推断的信息、一次性调试过程、寒暄、临时任务清单、会话原文搬运。',
+  '即使用户明确要求保存，上述排除项依然适用。',
+  '若用户要求保存 PR 列表、活动流水这类内容，先问其中什么是意外/非显然的——那才是值得留下的部分。',
   '先检查已有记忆。相同主题优先 update；不要创建近似重复条目；只有明确过时且应移除时才 delete。更新时保留源文件中仍有效的内容。',
 ].join('\n')
 
@@ -37,6 +54,7 @@ export class TurnRecorder {
     this.turnCounts = new Map()
     this.buffers = new Map()
     this.sessionCwds = new Map()
+    this.agentWrote = new Set()
     this.inFlight = new Set()
     this.pending = new Set()
   }
@@ -60,9 +78,23 @@ export class TurnRecorder {
       this.pushMessage(sessionId, 'assistant', extractEventText(event.data))
       return
     }
+    // 自我写入互斥(对齐上游 extractMemories.hasMemoryWritesSince):本回合主 agent 自己写过记忆 →
+    // 本回合跳过 fork 出来的后台提取,并推进游标(见下方 turn/end 分支)。
+    if (event.type === 'tool/call') {
+      if (MEMORY_WRITE_TOOLS.has(event.data?.name)) this.agentWrote.add(sessionId)
+      return
+    }
     if (event.type === 'turn/end' && REVIEWABLE_KINDS.has(event.data?.reason?.kind)) {
       const count = (this.turnCounts.get(sessionId) ?? 0) + 1
       this.turnCounts.set(sessionId, count)
+      // 计数照旧推进,保证"每 N 回合评审一次"的节奏不乱。
+      // 主 agent 本回合自己写过记忆 → 跳过本次评审并清空缓冲(等价上游游标推进,这段不再被下次提取重复处理)。
+      if (this.config.skipReviewAfterAgentWrite !== false && this.agentWrote.has(sessionId)) {
+        this.agentWrote.delete(sessionId)
+        this.buffers.delete(sessionId)
+        this.ctx.logger?.info?.(`[dsh-memory] review skipped code=AGENT_WROTE_MEMORY session=${shortId(sessionId)}`)
+        return
+      }
       const interval = Math.max(this.config.reviewInterval ?? 5, 1)
       if (count % interval === 0) void this.maybeReview(sessionId)
     }
@@ -84,6 +116,7 @@ export class TurnRecorder {
     this.turnCounts.delete(sessionId)
     this.buffers.delete(sessionId)
     this.sessionCwds.delete(sessionId)
+    this.agentWrote.delete(sessionId)
     this.inFlight.delete(sessionId)
     this.pending.delete(sessionId)
   }
@@ -194,6 +227,24 @@ export class TurnRecorder {
       ? manifest.map((item) => `- ${item.id} [${item.type}] ${item.title}${item.description ? ` — ${item.description}` : ''}`).join('\n')
       : '(当前作用域没有已有记忆)'
     const prompt = `已有记忆清单：\n${existing}\n\n待评审对话：\n${transcript}\n\n输出动作 JSON。`
+
+    // 模型偶发空输出(空回复/推理吃满预算)时自动重试一次,再判定失败。
+    let attempt = 0
+    while (true) {
+      const { text, finish } = await this.streamReview(llm, provider, model, prompt)
+      if (finish?.kind === 'error' || finish?.kind === 'aborted') {
+        throw new ReviewError(finish.failure?.code ?? `LLM_${finish.kind.toUpperCase()}`, finish.failure?.message ?? `LLM ${finish.kind}`)
+      }
+      if (!finish) throw new ReviewError('LLM_NO_FINISH', '自动记录模型流结束但没有 finish 终态')
+      if (finish.kind === 'max-tokens') throw new ReviewError('LLM_MAX_TOKENS', '自动记录输出达到 token 上限，结果可能不完整')
+      if (text.trim()) return parseReviewJson(text)
+      attempt++
+      if (attempt >= 2) throw new ReviewError('LLM_EMPTY_OUTPUT', '自动记录模型没有返回文本')
+    }
+  }
+
+  /** 单次评审流读取:超时/提前结束都释放迭代器,返回 { text, finish }。 */
+  async streamReview(llm, provider, model, prompt) {
     const controller = new AbortController()
     const timeoutMs = Math.max(this.config.reviewTimeoutMs ?? 120_000, 1)
     const maxTokens = this.config.reviewMaxTokens ?? 1_000
@@ -245,14 +296,7 @@ export class TurnRecorder {
       }
     }
 
-    if (finish?.kind === 'error' || finish?.kind === 'aborted') {
-      throw new ReviewError(finish.failure?.code ?? `LLM_${finish.kind.toUpperCase()}`, finish.failure?.message ?? `LLM ${finish.kind}`)
-    }
-    if (!finish) throw new ReviewError('LLM_NO_FINISH', '自动记录模型流结束但没有 finish 终态')
-    if (finish?.kind === 'max-tokens') throw new ReviewError('LLM_MAX_TOKENS', '自动记录输出达到 token 上限，结果可能不完整')
-    if (!text.trim()) throw new ReviewError('LLM_EMPTY_OUTPUT', '自动记录模型没有返回文本')
-    const parsed = parseReviewJson(text)
-    return parsed
+    return { text, finish }
   }
 
   resolveLlm() {

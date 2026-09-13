@@ -142,26 +142,27 @@ export async function importClaudeMemory(storageRoot, options = {}) {
       if (!existing || content.length > existing.content.length) byName.set(key, { abs, content })
     }
 
-    // 只有存在待写入的项目文件时才创建目标目录(不建空目录)
-    const pendingFiles = [...byName.values()]
-      .filter(({ abs }) => !GENERIC_SUBDIRS.has(basename(join(abs, '..'))))
-      .filter(({ abs }) => !marker[abs])
-    if (pendingFiles.length === 0) continue
-
-    const targetRoot = join(storageRoot, projectName)
-    await mkdir(targetRoot, { recursive: true })
-
+    // 通用基线文件先汇总:必须在"是否有待写入项目文件"判断之前收集,
+    // 否则只含通用文件的来源项目(无项目特定文件)会被 continue 掉、不参与跨项目去重。
     for (const { abs, content } of byName.values()) {
-      // 通用基线目录 → 顶层"通用"(跨项目内容去重,只留最完整一份)
-      const inGenericDir = GENERIC_SUBDIRS.has(basename(join(abs, '..')))
-      if (inGenericDir) {
-        const key = basename(abs)
-        const existing = genericByName.get(key)
-        if (!existing || content.length > existing.content.length) {
-          genericByName.set(key, { abs, content })
-        }
-        continue
+      if (!GENERIC_SUBDIRS.has(basename(join(abs, '..')))) continue
+      const key = basename(abs)
+      const existing = genericByName.get(key)
+      if (!existing || content.length > existing.content.length) {
+        genericByName.set(key, { abs, content })
       }
+    }
+
+    const projectFiles = [...byName.values()]
+      .filter(({ abs }) => !GENERIC_SUBDIRS.has(basename(join(abs, '..'))))
+    if (projectFiles.length === 0) continue
+
+    // 只有确实存在待写入的项目文件时才创建目标目录(不建空目录);
+    // 已记录来源的文件仍要计数为 skipped。
+    const targetRoot = join(storageRoot, projectName)
+    if (projectFiles.some(({ abs }) => !marker[abs])) await mkdir(targetRoot, { recursive: true })
+
+    for (const { abs, content } of projectFiles) {
       if (marker[abs]) { skipped++; continue }
       const target = join(targetRoot, basename(abs))
       const tagged = tagSource(content, projectName)
