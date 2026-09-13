@@ -7,6 +7,18 @@ import MemoryPanel from './Panel'
 export const inject = ['slots']
 
 export function apply(ctx) {
+  // 深色主题下让原生表单控件/下拉/滚动条按深色渲染(否则浏览器默认浅色外观)
+  if (typeof document !== 'undefined') {
+    try {
+      const tag = document.createElement('style')
+      tag.setAttribute('data-plugin', 'dsh-memory')
+      tag.textContent =
+        'body[data-ds-dark-theme] input, body[data-ds-dark-theme] select, ' +
+        'body[data-ds-dark-theme] textarea, body[data-ds-dark-theme] button { color-scheme: dark; }'
+      document.head.appendChild(tag)
+    } catch { /* 样式注入失败不影响功能 */ }
+  }
+
   const slots = ctx.get('slots')
   if (slots === undefined) return
 
